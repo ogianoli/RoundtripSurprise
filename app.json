@@ -1,0 +1,39 @@
+{
+  "expo": {
+    "name": "Roundtrip Surprise",
+    "slug": "roundtrip-surprise",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "roundtripsurprise",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "bundleIdentifier": "com.oliviergianoli.roundtripsurprise",
+      "buildNumber": "1",
+      "supportsTablet": false,
+      "usesNonExemptEncryption": false,
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Roundtrip Surprise uses your location to show where you are on the trip map and reveal nearby surprises."
+      }
+    },
+    "android": {
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION"
+      ],
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-secure-store"
+    ]
+  }
+}
