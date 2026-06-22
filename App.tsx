@@ -76,6 +76,13 @@ import {
   TripTodo,
 } from './src/types/trip';
 
+declare const process: {
+  env: {
+    EXPO_PUBLIC_SOCIAL_RESEARCH_ENDPOINT?: string;
+    EXPO_PUBLIC_YOUTUBE_API_KEY?: string;
+  };
+};
+
 type TabKey = 'map' | 'timeline' | 'todo' | 'moments';
 type ThemeKey = 'light' | 'dark' | 'lilac' | 'green' | 'blue';
 type CalendarMode = 'week' | 'month';
@@ -2509,19 +2516,11 @@ function inferMapCategory(value: string): MapCategory {
   return 'general';
 }
 
-function getPublicEnv(name: string) {
-  const globalWithProcess = globalThis as typeof globalThis & {
-    process?: { env?: Record<string, string | undefined> };
-  };
-
-  return globalWithProcess.process?.env?.[name];
-}
-
 async function createGuideForPlace(title: string, city: string): Promise<PlaceRecommendationGroup[]> {
   const label = `${title} ${city}`.trim();
   const socialGroups = await createSocialResearchGroups(label, {
-    backendEndpoint: getPublicEnv('EXPO_PUBLIC_SOCIAL_RESEARCH_ENDPOINT'),
-    youtubeApiKey: getPublicEnv('EXPO_PUBLIC_YOUTUBE_API_KEY'),
+    backendEndpoint: process.env.EXPO_PUBLIC_SOCIAL_RESEARCH_ENDPOINT,
+    youtubeApiKey: process.env.EXPO_PUBLIC_YOUTUBE_API_KEY,
   });
 
   return [...socialGroups, ...createLocalGuideForPlace(label)];
