@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: roundtrip-research-backend
+    runtime: node
+    region: frankfurt
+    plan: starter
+    buildCommand: npm ci
+    startCommand: npm run backend
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: MAX_RESULTS_PER_PROVIDER
+        value: "2"
+      - key: YOUTUBE_API_KEY
+        sync: false
+      - key: GOOGLE_PLACES_API_KEY
+        sync: false
+      - key: TIKTOK_RESEARCH_ACCESS_TOKEN
+        sync: false
