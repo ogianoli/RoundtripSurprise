@@ -9,7 +9,7 @@
     "userInterfaceStyle": "light",
     "ios": {
       "bundleIdentifier": "com.oliviergianoli.roundtripsurprise",
-      "buildNumber": "3",
+      "buildNumber": "4",
       "supportsTablet": false,
       "usesNonExemptEncryption": false,
       "infoPlist": {
