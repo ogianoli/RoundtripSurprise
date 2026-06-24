@@ -81,6 +81,8 @@ npx eas-cli@latest build --platform ios --profile production
 
 When EAS asks about Apple credentials, let EAS manage certificates and provisioning profiles.
 
+If Firebase sync is enabled, add the Firebase `EXPO_PUBLIC_FIREBASE_*` values from `FIREBASE_SYNC.md` before building.
+
 ## 5. Submit To TestFlight
 
 After the iOS build succeeds:

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Image,
@@ -35,7 +35,6 @@ import {
   Pencil,
   Plane,
   Plus,
-  Route,
   Save,
   Settings as SettingsIcon,
   Sparkles,
@@ -45,11 +44,16 @@ import {
 
 import { sampleTrip } from './src/data/sampleTrip';
 import {
+  CloudTripData,
+  isFirebaseSyncConfigured,
+  saveTripToCloud,
+  startTripCloudSync,
+} from './src/lib/firebaseSync';
+import {
   getRouteCoordinates,
   getRollingTripDates,
   getTripDayByDate,
   getStopsForDay,
-  getTripProgress,
   getUpcomingStop,
   offsetCoordinates,
   resolvePlaceCoordinates,
@@ -80,10 +84,17 @@ declare const process: {
   env: {
     EXPO_PUBLIC_SOCIAL_RESEARCH_ENDPOINT?: string;
     EXPO_PUBLIC_YOUTUBE_API_KEY?: string;
+    EXPO_PUBLIC_FIREBASE_API_KEY?: string;
+    EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN?: string;
+    EXPO_PUBLIC_FIREBASE_PROJECT_ID?: string;
+    EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET?: string;
+    EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID?: string;
+    EXPO_PUBLIC_FIREBASE_APP_ID?: string;
+    EXPO_PUBLIC_FIREBASE_TRIP_ID?: string;
   };
 };
 
-type TabKey = 'map' | 'timeline' | 'todo' | 'moments';
+type TabKey = 'map' | 'timeline' | 'todo' | 'studio';
 type ThemeKey = 'light' | 'dark' | 'lilac' | 'green' | 'blue';
 type CalendarMode = 'week' | 'month';
 type PlanPanel = 'calendar' | 'new';
@@ -97,6 +108,8 @@ const STOPS_FILE = 'stops.json';
 const DAYS_FILE = 'days.json';
 const TODOS_FILE = 'todos.json';
 const DOCUMENTS_FILE = 'documents.json';
+const SURPRISE_NOTIFICATIONS_FILE = 'surprise-notifications.json';
+const CLOUD_DEVICE_ID_KEY = 'roundtrip.cloudDeviceId.v1';
 
 const region = {
   latitude: 20.5,
@@ -229,6 +242,33 @@ async function writeLocalJson(fileName: string, value: unknown) {
   await FileSystem.writeAsStringAsync(`${LOCAL_DATA_DIRECTORY}${fileName}`, JSON.stringify(value));
 }
 
+async function getOrCreateCloudDeviceId() {
+  const storedId = await SecureStore.getItemAsync(CLOUD_DEVICE_ID_KEY);
+
+  if (storedId) {
+    return storedId;
+  }
+
+  const nextId = `device-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  await SecureStore.setItemAsync(CLOUD_DEVICE_ID_KEY, nextId);
+  return nextId;
+}
+
+function createCloudTripData(trip: CloudTripData): CloudTripData {
+  return {
+    dataVersion: trip.dataVersion,
+    days: trip.days,
+    documents: trip.documents,
+    stops: trip.stops,
+    surprises: trip.surprises,
+    todos: trip.todos,
+  };
+}
+
+function getTripDataSignature(trip: CloudTripData) {
+  return JSON.stringify(createCloudTripData(trip));
+}
+
 function mergeStopsWithDefaults(defaultStops: TripStop[], storedStops: TripStop[]) {
   const storedById = new Map(storedStops.map((stop) => [stop.id, stop]));
   const defaultIds = new Set(defaultStops.map((stop) => stop.id));
@@ -293,7 +333,13 @@ export default function App() {
   const [todos, setTodos] = useState<TripTodo[]>(sampleTrip.todos);
   const [documents, setDocuments] = useState<TripDocument[]>(sampleTrip.documents);
   const [surprises, setSurprises] = useState<SurpriseStop[]>(sampleTrip.surprises);
+  const [surpriseNotificationPrefs, setSurpriseNotificationPrefs] = useState<Record<string, boolean>>({});
   const [storageReady, setStorageReady] = useState(false);
+  const [cloudReady, setCloudReady] = useState(false);
+  const [cloudDeviceId, setCloudDeviceId] = useState('');
+  const [cloudSyncStatus, setCloudSyncStatus] = useState(
+    isFirebaseSyncConfigured() ? 'Cloud sync starting' : 'Cloud sync off',
+  );
   const [themeKey, setThemeKey] = useState<ThemeKey>('light');
   const [currentLocation, setCurrentLocation] = useState<Coordinates | undefined>();
   const [locationStatus, setLocationStatus] = useState('Location is off');
@@ -309,12 +355,14 @@ export default function App() {
   const [stepNotes, setStepNotes] = useState('');
   const [stepGuideEnabled, setStepGuideEnabled] = useState(true);
   const [stepGuideStatus, setStepGuideStatus] = useState('');
+  const [stepError, setStepError] = useState('');
   const [editingStopId, setEditingStopId] = useState<string | undefined>();
   const [editTitle, setEditTitle] = useState('');
   const [editCity, setEditCity] = useState('');
   const [editDate, setEditDate] = useState('');
   const [editNotes, setEditNotes] = useState('');
   const [editMapCategory, setEditMapCategory] = useState<MapCategory>('general');
+  const lastCloudSignature = useRef('');
 
   const theme = themes[themeKey];
 
@@ -353,6 +401,7 @@ export default function App() {
           storedDays,
           storedTodos,
           storedDocuments,
+          storedSurpriseNotifications,
         ] =
           await Promise.all([
             SecureStore.getItemAsync(THEME_KEY),
@@ -362,6 +411,7 @@ export default function App() {
             readLocalJson<TripDay[]>(DAYS_FILE),
             readLocalJson<TripTodo[]>(TODOS_FILE),
             readLocalJson<TripDocument[]>(DOCUMENTS_FILE),
+            readLocalJson<Record<string, boolean>>(SURPRISE_NOTIFICATIONS_FILE),
           ]);
 
         if (!mounted) {
@@ -409,6 +459,10 @@ export default function App() {
               : mergeRecordsWithDefaults(sampleTrip.surprises, storedSurprises),
           );
         }
+
+        if (storedSurpriseNotifications && typeof storedSurpriseNotifications === 'object') {
+          setSurpriseNotificationPrefs(storedSurpriseNotifications);
+        }
       } catch {
         setLocationStatus('Local storage unavailable');
       } finally {
@@ -442,12 +496,116 @@ export default function App() {
       writeLocalJson(DAYS_FILE, days),
       writeLocalJson(TODOS_FILE, todos),
       writeLocalJson(DOCUMENTS_FILE, documents),
+      writeLocalJson(SURPRISE_NOTIFICATIONS_FILE, surpriseNotificationPrefs),
       SecureStore.setItemAsync(THEME_KEY, themeKey),
       SecureStore.setItemAsync(DATA_VERSION_KEY, DATA_VERSION),
     ]).catch(() => {
       setLocationStatus('Could not save local app data');
     });
-  }, [days, documents, storageReady, stops, surprises, themeKey, todos]);
+  }, [days, documents, storageReady, stops, surpriseNotificationPrefs, surprises, themeKey, todos]);
+
+  useEffect(() => {
+    if (!storageReady) {
+      return;
+    }
+
+    if (!isFirebaseSyncConfigured()) {
+      setCloudSyncStatus('Cloud sync off');
+      return;
+    }
+
+    let mounted = true;
+    let unsubscribe: (() => void) | undefined;
+
+    async function connectCloudSync() {
+      try {
+        const deviceId = await getOrCreateCloudDeviceId();
+
+        if (!mounted) {
+          return;
+        }
+
+        setCloudDeviceId(deviceId);
+        unsubscribe = await startTripCloudSync({
+          deviceId,
+          onMissingTrip: () => {
+            if (mounted) {
+              setCloudReady(true);
+            }
+          },
+          onRemoteTrip: (remoteTrip) => {
+            if (!mounted) {
+              return;
+            }
+
+            lastCloudSignature.current = getTripDataSignature(remoteTrip);
+            setStops(remoteTrip.stops);
+            setDays(remoteTrip.days);
+            setTodos(remoteTrip.todos);
+            setDocuments(remoteTrip.documents);
+            setSurprises(remoteTrip.surprises);
+            setCloudReady(true);
+          },
+          onStatus: (status) => {
+            if (mounted) {
+              setCloudSyncStatus(status);
+            }
+          },
+        });
+      } catch {
+        if (mounted) {
+          setCloudSyncStatus('Cloud sync unavailable');
+        }
+      }
+    }
+
+    connectCloudSync();
+
+    return () => {
+      mounted = false;
+      unsubscribe?.();
+    };
+  }, [storageReady]);
+
+  useEffect(() => {
+    if (!storageReady || !cloudReady || !cloudDeviceId || !isFirebaseSyncConfigured()) {
+      return;
+    }
+
+    const tripData = createCloudTripData({
+      dataVersion: DATA_VERSION,
+      days,
+      documents,
+      stops,
+      surprises,
+      todos,
+    });
+    const signature = getTripDataSignature(tripData);
+
+    if (signature === lastCloudSignature.current) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setCloudSyncStatus('Cloud saving...');
+      saveTripToCloud(tripData, cloudDeviceId)
+        .then(() => {
+          lastCloudSignature.current = signature;
+          setCloudSyncStatus('Cloud synced');
+        })
+        .catch(() => {
+          setCloudSyncStatus('Cloud save failed');
+        });
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [cloudDeviceId, cloudReady, days, documents, storageReady, stops, surprises, todos]);
+
+  useEffect(() => {
+    if (!ownerMode && activeTab === 'studio') {
+      setActiveTab('map');
+    }
+  }, [activeTab, ownerMode]);
 
   const completedStopIds = useMemo(
     () =>
@@ -459,16 +617,12 @@ export default function App() {
 
   const visibleSurprises = useMemo(
     () => {
-      if (!ownerMode) {
-        return [];
-      }
-
       return getVisibleSurprises(surprises, {
         ownerMode,
         now,
         currentLocation,
         completedStopIds,
-      });
+      }).filter((surprise) => ownerMode || surprise.currentVisibility === 'revealed');
     },
     [completedStopIds, currentLocation, now, ownerMode, surprises],
   );
@@ -491,7 +645,14 @@ export default function App() {
     [secondVisibleDay, trip],
   );
   const upcomingStop = useMemo(() => getUpcomingStop(trip.stops, now), [now, trip.stops]);
-  const progress = useMemo(() => getTripProgress(trip.stops, now), [now, trip.stops]);
+  const firstVisibleSurprises = useMemo(
+    () => getSurprisesForDate(visibleSurprises, visibleDates[0], trip.stops),
+    [trip.stops, visibleDates, visibleSurprises],
+  );
+  const secondVisibleSurprises = useMemo(
+    () => getSurprisesForDate(visibleSurprises, visibleDates[1], trip.stops),
+    [trip.stops, visibleDates, visibleSurprises],
+  );
 
   function handleOwnerGestureStep(step: string) {
     if (!settingsVisible) {
@@ -535,7 +696,7 @@ export default function App() {
     setGateVisible(false);
     setPinEntry('');
     setPinError('');
-    setActiveTab('moments');
+    setActiveTab('studio');
   }
 
   async function requestLocation() {
@@ -592,10 +753,24 @@ export default function App() {
     const title = stepTitle.trim();
     const city = stepCity.trim() || title;
     const notes = stepNotes.trim() || 'New trip step. Add details later.';
+    const date = stepDate.trim();
 
     if (!title) {
+      setStepError('Add a place name before creating the card.');
       return;
     }
+
+    if (!date) {
+      setStepError('Add a date for this plan.');
+      return;
+    }
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      setStepError('Use the date format YYYY-MM-DD.');
+      return;
+    }
+
+    setStepError('');
 
     if (stepGuideEnabled) {
       setStepGuideStatus('Researching TikTok and YouTube tips...');
@@ -613,7 +788,7 @@ export default function App() {
       title,
       city,
       country: inferCountry(`${title} ${city}`),
-      startsAt: `${stepDate}T10:00:00+08:00`,
+      startsAt: `${date}T10:00:00+08:00`,
       coordinates,
       kind: 'stay',
       notes,
@@ -624,7 +799,7 @@ export default function App() {
       coverColor: theme.accentDark,
     };
 
-    const existingDay = days.find((day) => day.date === stepDate);
+    const existingDay = days.find((day) => day.date === date);
     const nextDays = existingDay
       ? days.map((day) =>
           day.id === existingDay.id ? { ...day, stops: [...day.stops, stopId] } : day,
@@ -632,8 +807,8 @@ export default function App() {
       : [
           ...days,
           {
-            id: `day-${stepDate}`,
-            date: stepDate,
+            id: `day-${date}`,
+            date,
             title: city,
             summary: 'Added from the app.',
             stops: [stopId],
@@ -648,6 +823,7 @@ export default function App() {
     setStepCity('');
     setStepNotes('');
     setStepGuideStatus('');
+    setStepError('');
   }
 
   function openStopCard(stopId: string) {
@@ -678,6 +854,7 @@ export default function App() {
     const date = editDate.trim();
 
     if (!title || !city || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      Alert.alert('Missing details', 'Add a title, area, and date in YYYY-MM-DD format before saving.');
       return;
     }
 
@@ -748,6 +925,13 @@ export default function App() {
 
   function revealNow(surpriseId: string) {
     setSurprises((current) => revealSurprise(current, surpriseId));
+  }
+
+  function toggleSurpriseNotification(surpriseId: string) {
+    setSurpriseNotificationPrefs((current) => ({
+      ...current,
+      [surpriseId]: !current[surpriseId],
+    }));
   }
 
   async function addPdfToStop(stopId: string) {
@@ -825,11 +1009,14 @@ export default function App() {
       {activeTab === 'map' && (
         <MapScreen
           currentLocation={currentLocation}
+          firstVisibleSurprises={firstVisibleSurprises}
           locationStatus={locationStatus}
-          progress={progress}
+          ownerMode={ownerMode}
           requestLocation={requestLocation}
+          secondVisibleSurprises={secondVisibleSurprises}
           selectedStop={selectedStop}
           onOpenStop={openStopCard}
+          onToggleSurpriseNotification={toggleSurpriseNotification}
           theme={theme}
           firstVisibleDate={visibleDates[0]}
           firstVisibleDay={firstVisibleDay}
@@ -839,6 +1026,7 @@ export default function App() {
           secondVisibleStops={secondVisibleStops}
           trip={trip}
           upcomingStop={upcomingStop}
+          surpriseNotificationPrefs={surpriseNotificationPrefs}
           visibleSurprises={visibleSurprises}
         />
       )}
@@ -850,6 +1038,8 @@ export default function App() {
           guideEnabled={stepGuideEnabled}
           guideStatus={stepGuideStatus}
           onOpenStop={openStopCard}
+          onToggleSurpriseNotification={toggleSurpriseNotification}
+          ownerMode={ownerMode}
           planPanel={planPanel}
           setCalendarMode={setCalendarMode}
           setGuideEnabled={setStepGuideEnabled}
@@ -860,10 +1050,13 @@ export default function App() {
           setStepTitle={setStepTitle}
           stepCity={stepCity}
           stepDate={stepDate}
+          stepError={stepError}
           stepNotes={stepNotes}
           stepTitle={stepTitle}
+          surpriseNotificationPrefs={surpriseNotificationPrefs}
           theme={theme}
           trip={trip}
+          visibleSurprises={visibleSurprises}
           windowStartDate={visibleDates[0]}
         />
       )}
@@ -874,7 +1067,7 @@ export default function App() {
         </ScrollView>
       )}
 
-      {activeTab === 'moments' && (
+      {activeTab === 'studio' && ownerMode && (
         <MomentsScreen
           addSurprise={addSurprise}
           draftAnchorId={draftAnchorId}
@@ -917,13 +1110,15 @@ export default function App() {
           onPress={() => setActiveTab('todo')}
           theme={theme}
         />
-        <TabButton
-          active={activeTab === 'moments'}
-          icon={(color) => <Sparkles size={18} color={color} />}
-          label={ownerMode ? 'Studio' : 'Moments'}
-          onPress={() => setActiveTab('moments')}
-          theme={theme}
-        />
+        {ownerMode && (
+          <TabButton
+            active={activeTab === 'studio'}
+            icon={(color) => <Sparkles size={18} color={color} />}
+            label="Studio"
+            onPress={() => setActiveTab('studio')}
+            theme={theme}
+          />
+        )}
       </View>
 
       <PlaceCardModal
@@ -955,6 +1150,7 @@ export default function App() {
         onClose={closeSettings}
         onHiddenGestureStep={handleOwnerGestureStep}
         setThemeKey={setThemeKey}
+        syncStatus={cloudSyncStatus}
         theme={theme}
         themeKey={themeKey}
         visible={settingsVisible}
@@ -977,15 +1173,19 @@ function MapScreen({
   currentLocation,
   firstVisibleDate,
   firstVisibleDay,
+  firstVisibleSurprises,
   firstVisibleStops,
   locationStatus,
   onOpenStop,
-  progress,
+  onToggleSurpriseNotification,
+  ownerMode,
   requestLocation,
   secondVisibleDate,
   secondVisibleDay,
+  secondVisibleSurprises,
   secondVisibleStops,
   selectedStop,
+  surpriseNotificationPrefs,
   theme,
   trip,
   upcomingStop,
@@ -994,15 +1194,19 @@ function MapScreen({
   currentLocation?: Coordinates;
   firstVisibleDate: string;
   firstVisibleDay?: TripDay;
+  firstVisibleSurprises: RevealedSurprise[];
   firstVisibleStops: TripStop[];
   locationStatus: string;
   onOpenStop: (stopId: string) => void;
-  progress: number;
+  onToggleSurpriseNotification: (surpriseId: string) => void;
+  ownerMode: boolean;
   requestLocation: () => void;
   secondVisibleDate: string;
   secondVisibleDay?: TripDay;
+  secondVisibleSurprises: RevealedSurprise[];
   secondVisibleStops: TripStop[];
   selectedStop?: TripStop;
+  surpriseNotificationPrefs: Record<string, boolean>;
   theme: (typeof themes)[ThemeKey];
   trip: Trip;
   upcomingStop?: TripStop;
@@ -1071,10 +1275,6 @@ function MapScreen({
             <Marker coordinate={currentLocation} pinColor={theme.text} title="You are here" />
           )}
         </MapView>
-        <View style={[styles.mapBadge, { backgroundColor: theme.surface }]}>
-          <Route size={16} color={theme.text} />
-          <Text style={[styles.mapBadgeText, { color: theme.text }]}>{progress}% planned</Text>
-        </View>
       </View>
 
       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.mapLegend}>
@@ -1132,7 +1332,11 @@ function MapScreen({
         day={firstVisibleDay}
         emptyText="No planned trip places on this date."
         onOpenStop={onOpenStop}
+        onToggleSurpriseNotification={onToggleSurpriseNotification}
+        ownerMode={ownerMode}
         stops={firstVisibleStops}
+        surpriseNotificationPrefs={surpriseNotificationPrefs}
+        surprises={firstVisibleSurprises}
         theme={theme}
       />
       <DayPlanSection
@@ -1140,7 +1344,11 @@ function MapScreen({
         day={secondVisibleDay}
         emptyText="No planned trip places on this date."
         onOpenStop={onOpenStop}
+        onToggleSurpriseNotification={onToggleSurpriseNotification}
+        ownerMode={ownerMode}
         stops={secondVisibleStops}
+        surpriseNotificationPrefs={surpriseNotificationPrefs}
+        surprises={secondVisibleSurprises}
         theme={theme}
       />
     </ScrollView>
@@ -1547,16 +1755,26 @@ function DayPlanSection({
   day,
   emptyText,
   onOpenStop,
+  onToggleSurpriseNotification,
+  ownerMode,
   stops,
+  surpriseNotificationPrefs,
+  surprises,
   theme,
 }: {
   date: string;
   day?: TripDay;
   emptyText: string;
   onOpenStop: (stopId: string) => void;
+  onToggleSurpriseNotification: (surpriseId: string) => void;
+  ownerMode: boolean;
   stops: TripStop[];
+  surpriseNotificationPrefs: Record<string, boolean>;
+  surprises: RevealedSurprise[];
   theme: (typeof themes)[ThemeKey];
 }) {
+  const itemCount = stops.length + surprises.length;
+
   return (
     <View>
       <View style={styles.sectionHeader}>
@@ -1565,18 +1783,78 @@ function DayPlanSection({
           {day && <Text style={[styles.sectionMeta, { color: theme.muted }]}>{day.title}</Text>}
         </View>
         <Text style={[styles.sectionMeta, { color: theme.muted }]}>
-          {day ? `${stops.length} places` : 'Real date'}
+          {day ? `${itemCount} items` : 'Real date'}
         </Text>
       </View>
-      {stops.length === 0 ? (
+      {itemCount === 0 ? (
         <View style={[styles.emptyMini, { backgroundColor: theme.surface, borderColor: theme.border }]}>
           <Text style={[styles.compactMeta, { color: theme.muted }]}>{emptyText}</Text>
         </View>
       ) : (
-        stops.map((stop) => (
-          <StopCard key={stop.id} onPress={() => onOpenStop(stop.id)} stop={stop} theme={theme} />
-        ))
+        <>
+          {stops.map((stop) => (
+            <StopCard key={stop.id} onPress={() => onOpenStop(stop.id)} stop={stop} theme={theme} />
+          ))}
+          {surprises.map((surprise) => (
+            <SurprisePlanCard
+              key={surprise.id}
+              notifyEnabled={Boolean(surpriseNotificationPrefs[surprise.id])}
+              onToggleNotification={() => onToggleSurpriseNotification(surprise.id)}
+              ownerMode={ownerMode}
+              surprise={surprise}
+              theme={theme}
+            />
+          ))}
+        </>
       )}
+    </View>
+  );
+}
+
+function SurprisePlanCard({
+  notifyEnabled,
+  onToggleNotification,
+  ownerMode,
+  surprise,
+  theme,
+}: {
+  notifyEnabled: boolean;
+  onToggleNotification: () => void;
+  ownerMode: boolean;
+  surprise: RevealedSurprise;
+  theme: (typeof themes)[ThemeKey];
+}) {
+  return (
+    <View style={[styles.surprisePlanCard, { borderColor: '#F2C94C' }]}>
+      <View style={[styles.surprisePlanIcon, { backgroundColor: '#F2C94C' }]}>
+        <Sparkles size={18} color="#1C1E2E" />
+      </View>
+      <View style={styles.flexOne}>
+        <Text style={[styles.compactTitle, { color: '#1C1E2E' }]}>
+          {surprise.currentVisibility === 'revealed' ? surprise.title : 'Locked surprise'}
+        </Text>
+        <Text style={[styles.bodyText, { color: '#5D4D13' }]}>
+          {surprise.currentVisibility === 'revealed'
+            ? surprise.message
+            : surprise.teaser ?? 'Something is waiting.'}
+        </Text>
+        {!ownerMode && (
+          <Pressable
+            accessibilityRole="button"
+            onPress={onToggleNotification}
+            style={[styles.notifyButton, { backgroundColor: notifyEnabled ? theme.text : '#FFFFFF' }]}
+          >
+            <Text
+              style={[
+                styles.notifyButtonText,
+                { color: notifyEnabled ? theme.surface : theme.text },
+              ]}
+            >
+              {notifyEnabled ? 'Notifications on' : 'Notify me'}
+            </Text>
+          </Pressable>
+        )}
+      </View>
     </View>
   );
 }
@@ -1587,6 +1865,7 @@ function CalendarSection({
   setMode,
   theme,
   trip,
+  visibleSurprises,
   windowStartDate,
 }: {
   mode: CalendarMode;
@@ -1594,11 +1873,12 @@ function CalendarSection({
   setMode: (mode: CalendarMode) => void;
   theme: (typeof themes)[ThemeKey];
   trip: Trip;
+  visibleSurprises: RevealedSurprise[];
   windowStartDate: string;
 }) {
   const visibleDays = useMemo(
-    () => getCalendarDays(trip.days, mode, windowStartDate),
-    [mode, trip.days, windowStartDate],
+    () => getCalendarDays(trip.days, mode, windowStartDate, trip.stops, visibleSurprises),
+    [mode, trip.days, trip.stops, visibleSurprises, windowStartDate],
   );
 
   return (
@@ -1646,7 +1926,6 @@ function CalendarSection({
               </Text>
             </View>
             <View style={styles.flexOne}>
-              <Text style={[styles.compactTitle, { color: theme.text }]}>{day.title}</Text>
               {stops.map((stop) => (
                 <Pressable
                   accessibilityRole="button"
@@ -1657,6 +1936,14 @@ function CalendarSection({
                   <Text style={styles.calendarStopEmoji}>{getStopEmoji(stop)}</Text>
                   <Text style={[styles.compactMeta, { color: theme.muted }]}>{stop.title}</Text>
                 </Pressable>
+              ))}
+              {getSurprisesForDate(visibleSurprises, day.date, trip.stops).map((surprise) => (
+                <View key={surprise.id} style={styles.calendarStop}>
+                  <Text style={styles.calendarStopEmoji}>✨</Text>
+                  <Text style={[styles.compactMeta, { color: theme.accentDark }]}>
+                    {surprise.currentVisibility === 'revealed' ? surprise.title : 'Locked surprise'}
+                  </Text>
+                </View>
               ))}
             </View>
           </View>
@@ -1715,6 +2002,8 @@ function TimelineScreen({
   guideEnabled,
   guideStatus,
   onOpenStop,
+  onToggleSurpriseNotification,
+  ownerMode,
   planPanel,
   setCalendarMode,
   setGuideEnabled,
@@ -1725,10 +2014,13 @@ function TimelineScreen({
   setStepTitle,
   stepCity,
   stepDate,
+  stepError,
   stepNotes,
   stepTitle,
+  surpriseNotificationPrefs,
   theme,
   trip,
+  visibleSurprises,
   windowStartDate,
 }: {
   addStep: () => void;
@@ -1736,6 +2028,8 @@ function TimelineScreen({
   guideEnabled: boolean;
   guideStatus: string;
   onOpenStop: (stopId: string) => void;
+  onToggleSurpriseNotification: (surpriseId: string) => void;
+  ownerMode: boolean;
   planPanel: PlanPanel;
   setCalendarMode: (mode: CalendarMode) => void;
   setGuideEnabled: (value: boolean) => void;
@@ -1746,16 +2040,16 @@ function TimelineScreen({
   setStepTitle: (value: string) => void;
   stepCity: string;
   stepDate: string;
+  stepError: string;
   stepNotes: string;
   stepTitle: string;
+  surpriseNotificationPrefs: Record<string, boolean>;
   theme: (typeof themes)[ThemeKey];
   trip: Trip;
+  visibleSurprises: RevealedSurprise[];
   windowStartDate: string;
 }) {
-  const canAddStep =
-    stepTitle.trim().length > 0 &&
-    /^\d{4}-\d{2}-\d{2}$/.test(stepDate) &&
-    guideStatus.length === 0;
+  const addDisabled = guideStatus.length > 0;
 
   return (
     <ScrollView contentContainerStyle={styles.screenContent} showsVerticalScrollIndicator={false}>
@@ -1791,6 +2085,7 @@ function TimelineScreen({
           setMode={setCalendarMode}
           theme={theme}
           trip={trip}
+          visibleSurprises={visibleSurprises}
           windowStartDate={windowStartDate}
         />
       ) : (
@@ -1871,14 +2166,17 @@ function TimelineScreen({
         {guideStatus ? (
           <Text style={[styles.compactMeta, { color: theme.accentDark }]}>{guideStatus}</Text>
         ) : null}
+        {stepError ? (
+          <Text style={styles.errorText}>{stepError}</Text>
+        ) : null}
         <Pressable
               accessibilityRole="button"
-              disabled={!canAddStep}
+              disabled={addDisabled}
               onPress={addStep}
               style={[
                 styles.addButton,
                 { backgroundColor: theme.accent },
-                !canAddStep && styles.addButtonDisabled,
+                addDisabled && styles.addButtonDisabled,
               ]}
             >
               <Plus size={18} color="#FFFFFF" />
@@ -1888,6 +2186,7 @@ function TimelineScreen({
 
           {trip.days.map((day, dayIndex) => {
             const dayStops = getStopsForDay(trip, day);
+            const daySurprises = getSurprisesForDate(visibleSurprises, day.date, trip.stops);
             return (
               <View key={day.id} style={styles.dayBlock}>
                 <View style={[styles.dayMarker, { backgroundColor: theme.text }]}>
@@ -1902,7 +2201,10 @@ function TimelineScreen({
                       accessibilityRole="button"
                       key={stop.id}
                       onPress={() => onOpenStop(stop.id)}
-                      style={styles.compactStop}
+                      style={[
+                        styles.compactStop,
+                        { backgroundColor: theme.softSurface, borderColor: theme.border },
+                      ]}
                     >
                       <View style={[styles.compactDot, { backgroundColor: stop.coverColor }]} />
                       <View style={styles.compactText}>
@@ -1913,6 +2215,16 @@ function TimelineScreen({
                       </View>
                       <ExternalLink size={15} color={theme.text} />
                     </Pressable>
+                  ))}
+                  {daySurprises.map((surprise) => (
+                    <SurprisePlanCard
+                      key={surprise.id}
+                      notifyEnabled={Boolean(surpriseNotificationPrefs[surprise.id])}
+                      onToggleNotification={() => onToggleSurpriseNotification(surprise.id)}
+                      ownerMode={ownerMode}
+                      surprise={surprise}
+                      theme={theme}
+                    />
                   ))}
                 </View>
               </View>
@@ -2132,11 +2444,13 @@ function MomentsScreen({
 function SettingsScreen({
   onHiddenGestureStep,
   setThemeKey,
+  syncStatus,
   theme,
   themeKey,
 }: {
   onHiddenGestureStep: (step: string) => void;
   setThemeKey: (themeKey: ThemeKey) => void;
+  syncStatus: string;
   theme: (typeof themes)[ThemeKey];
   themeKey: ThemeKey;
 }) {
@@ -2182,6 +2496,10 @@ function SettingsScreen({
           })}
         </View>
       </View>
+      <View style={[styles.primaryPanel, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+        <Text style={[styles.eyebrow, { color: theme.muted }]}>Sync</Text>
+        <Text style={[styles.compactTitle, { color: theme.text }]}>{syncStatus}</Text>
+      </View>
     </ScrollView>
   );
 }
@@ -2190,6 +2508,7 @@ function SettingsModal({
   onClose,
   onHiddenGestureStep,
   setThemeKey,
+  syncStatus,
   theme,
   themeKey,
   visible,
@@ -2197,6 +2516,7 @@ function SettingsModal({
   onClose: () => void;
   onHiddenGestureStep: (step: string) => void;
   setThemeKey: (themeKey: ThemeKey) => void;
+  syncStatus: string;
   theme: (typeof themes)[ThemeKey];
   themeKey: ThemeKey;
   visible: boolean;
@@ -2218,6 +2538,7 @@ function SettingsModal({
           <SettingsScreen
             onHiddenGestureStep={onHiddenGestureStep}
             setThemeKey={setThemeKey}
+            syncStatus={syncStatus}
             theme={theme}
             themeKey={themeKey}
           />
@@ -2241,7 +2562,10 @@ function StopCard({
       accessibilityRole="button"
       disabled={!onPress}
       onPress={onPress}
-      style={[styles.stopCard, { backgroundColor: theme.surface, borderColor: theme.border }]}
+      style={[
+        styles.stopCard,
+        { backgroundColor: onPress ? theme.softSurface : theme.surface, borderColor: theme.border },
+      ]}
     >
       <View style={[styles.stopColor, { backgroundColor: stop.coverColor }]} />
       <View style={styles.stopCardBody}>
@@ -2379,18 +2703,54 @@ function isMapPlaceStop(stop: TripStop) {
   return true;
 }
 
-function getCalendarDays(days: TripDay[], mode: CalendarMode, windowStartDate: string) {
+function getCalendarDays(
+  days: TripDay[],
+  mode: CalendarMode,
+  windowStartDate: string,
+  stops: TripStop[],
+  surprises: RevealedSurprise[],
+) {
   const sortedDays = days
     .slice()
     .sort((left, right) => Date.parse(`${left.date}T12:00:00`) - Date.parse(`${right.date}T12:00:00`));
+  const knownStopIds = new Set(stops.map((stop) => stop.id));
+  const daysWithItems = sortedDays.filter((day) => {
+    const hasStops = day.stops.some((stopId) => knownStopIds.has(stopId));
+    const hasSurprises = getSurprisesForDate(surprises, day.date, stops).length > 0;
+    return hasStops || hasSurprises;
+  });
 
   if (mode === 'week') {
     const endDate = addIsoDays(windowStartDate, 7);
-    return sortedDays.filter((day) => day.date >= windowStartDate && day.date < endDate);
+    return daysWithItems.filter((day) => day.date >= windowStartDate && day.date < endDate);
   }
 
   const month = windowStartDate.slice(0, 7);
-  return sortedDays.filter((day) => day.date.startsWith(month));
+  return daysWithItems.filter((day) => day.date.startsWith(month));
+}
+
+function getSurprisesForDate(
+  surprises: RevealedSurprise[],
+  date: string,
+  stops: TripStop[],
+) {
+  return surprises.filter((surprise) => getSurprisePlanDate(surprise, stops) === date);
+}
+
+function getSurprisePlanDate(surprise: RevealedSurprise, stops: TripStop[]) {
+  if (surprise.revealAt) {
+    return surprise.revealAt.slice(0, 10);
+  }
+
+  const anchor = surprise.anchorStopId
+    ? stops.find((stop) => stop.id === surprise.anchorStopId)
+    : undefined;
+
+  if (anchor) {
+    return anchor.startsAt.slice(0, 10);
+  }
+
+  return surprise.createdAt.slice(0, 10);
 }
 
 function addIsoDays(date: string, offsetDays: number) {
@@ -2869,10 +3229,12 @@ const styles = StyleSheet.create({
   compactStop: {
     alignItems: 'flex-start',
     borderRadius: 8,
+    borderWidth: 1,
     flexDirection: 'row',
     gap: 10,
     marginTop: 14,
     minHeight: 46,
+    paddingHorizontal: 10,
     paddingVertical: 6,
   },
   compactText: {
@@ -3196,6 +3558,18 @@ const styles = StyleSheet.create({
     minHeight: 86,
     paddingTop: 12,
     textAlignVertical: 'top',
+  },
+  notifyButton: {
+    alignSelf: 'flex-start',
+    borderRadius: 8,
+    marginTop: 10,
+    minHeight: 34,
+    justifyContent: 'center',
+    paddingHorizontal: 12,
+  },
+  notifyButtonText: {
+    fontSize: 12,
+    fontWeight: '900',
   },
   ownerPill: {
     alignItems: 'center',
@@ -3529,6 +3903,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     flexDirection: 'row',
     gap: 12,
+    marginBottom: 12,
     padding: 14,
   },
   todoCheck: {
@@ -3538,6 +3913,23 @@ const styles = StyleSheet.create({
     height: 28,
     justifyContent: 'center',
     width: 28,
+  },
+  surprisePlanCard: {
+    alignItems: 'flex-start',
+    backgroundColor: '#FFF3B0',
+    borderRadius: 8,
+    borderWidth: 1,
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 10,
+    padding: 12,
+  },
+  surprisePlanIcon: {
+    alignItems: 'center',
+    borderRadius: 8,
+    height: 34,
+    justifyContent: 'center',
+    width: 34,
   },
   twoColumnRow: {
     flexDirection: 'row',

@@ -9,11 +9,12 @@
     "userInterfaceStyle": "light",
     "ios": {
       "bundleIdentifier": "com.oliviergianoli.roundtripsurprise",
-      "buildNumber": "1",
+      "buildNumber": "3",
       "supportsTablet": false,
       "usesNonExemptEncryption": false,
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Roundtrip Surprise uses your location to show where you are on the trip map and reveal nearby surprises."
+        "NSLocationWhenInUseUsageDescription": "Roundtrip Surprise uses your location to show where you are on the trip map and reveal nearby surprises.",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
@@ -34,6 +35,11 @@
     },
     "plugins": [
       "expo-secure-store"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "a3214531-0bd7-40ba-af6b-10d096a0e31e"
+      }
+    }
   }
 }
