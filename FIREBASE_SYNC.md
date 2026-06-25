@@ -53,6 +53,8 @@ Before a public App Store release, tighten this with a proper member list or inv
 - If Firebase is configured, the app signs in anonymously and syncs the shared trip document.
 - Local edits are saved locally first and pushed to Firestore with a short debounce.
 - Remote edits from another phone are pulled into the app and then cached locally.
+- Push notification device tokens are stored in the same trip document under `pushDevices`.
+- Each phone must open Settings and enable surprise alerts once before it can receive reveal notifications.
 - PDF files still live locally in this version; cloud file storage for PDFs/photos should be a later pass.
 
 Official docs:

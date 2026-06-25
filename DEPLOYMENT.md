@@ -83,6 +83,8 @@ When EAS asks about Apple credentials, let EAS manage certificates and provision
 
 If Firebase sync is enabled, add the Firebase `EXPO_PUBLIC_FIREBASE_*` values from `FIREBASE_SYNC.md` before building.
 
+Push notifications are configured with `expo-notifications`. During the first iOS build after this change, let EAS manage Apple push notification credentials if it asks. After installing the build, each iPhone should open Settings in the app and tap "Enable surprise alerts" once.
+
 ## 5. Submit To TestFlight
 
 After the iOS build succeeds:

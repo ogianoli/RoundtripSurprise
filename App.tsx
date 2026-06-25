@@ -46,6 +46,7 @@ import { sampleTrip } from './src/data/sampleTrip';
 import {
   CloudTripData,
   isFirebaseSyncConfigured,
+  savePushDeviceToCloud,
   saveTripToCloud,
   startTripCloudSync,
 } from './src/lib/firebaseSync';
@@ -66,6 +67,11 @@ import {
   revealSurprise,
 } from './src/lib/surprises';
 import { createSocialResearchGroups } from './src/lib/socialResearch';
+import {
+  PushDevice,
+  registerForSurprisePushNotifications,
+  sendSurpriseRevealPushNotifications,
+} from './src/lib/pushNotifications';
 import {
   Coordinates,
   MapCategory,
@@ -108,7 +114,6 @@ const STOPS_FILE = 'stops.json';
 const DAYS_FILE = 'days.json';
 const TODOS_FILE = 'todos.json';
 const DOCUMENTS_FILE = 'documents.json';
-const SURPRISE_NOTIFICATIONS_FILE = 'surprise-notifications.json';
 const CLOUD_DEVICE_ID_KEY = 'roundtrip.cloudDeviceId.v1';
 
 const region = {
@@ -131,7 +136,8 @@ const mapCategoryLegend: Array<{ category: MapCategory; label: string }> = [
   { category: 'stay', label: 'Stay' },
   { category: 'hike', label: 'Hike' },
   { category: 'beach', label: 'Beach' },
-  { category: 'activity', label: 'Plan' },
+  { category: 'travel', label: 'Flight' },
+  { category: 'activity', label: 'Sightseeing' },
 ];
 
 const editableMapCategories: Array<{ category: MapCategory; label: string }> = [
@@ -140,7 +146,8 @@ const editableMapCategories: Array<{ category: MapCategory; label: string }> = [
   { category: 'hike', label: 'Hike' },
   { category: 'beach', label: 'Beach' },
   { category: 'food', label: 'Food' },
-  { category: 'activity', label: 'Plan' },
+  { category: 'travel', label: 'Flight' },
+  { category: 'activity', label: 'Sightseeing' },
 ];
 
 const themes: Record<
@@ -333,13 +340,14 @@ export default function App() {
   const [todos, setTodos] = useState<TripTodo[]>(sampleTrip.todos);
   const [documents, setDocuments] = useState<TripDocument[]>(sampleTrip.documents);
   const [surprises, setSurprises] = useState<SurpriseStop[]>(sampleTrip.surprises);
-  const [surpriseNotificationPrefs, setSurpriseNotificationPrefs] = useState<Record<string, boolean>>({});
   const [storageReady, setStorageReady] = useState(false);
   const [cloudReady, setCloudReady] = useState(false);
   const [cloudDeviceId, setCloudDeviceId] = useState('');
   const [cloudSyncStatus, setCloudSyncStatus] = useState(
     isFirebaseSyncConfigured() ? 'Cloud sync starting' : 'Cloud sync off',
   );
+  const [pushDevices, setPushDevices] = useState<Record<string, PushDevice>>({});
+  const [pushStatus, setPushStatus] = useState('Notifications off');
   const [themeKey, setThemeKey] = useState<ThemeKey>('light');
   const [currentLocation, setCurrentLocation] = useState<Coordinates | undefined>();
   const [locationStatus, setLocationStatus] = useState('Location is off');
@@ -349,10 +357,13 @@ export default function App() {
   const [draftTeaser, setDraftTeaser] = useState('');
   const [draftAnchorId, setDraftAnchorId] = useState('mondrian-singapore');
   const [draftRevealMode, setDraftRevealMode] = useState<RevealMode>('manual');
+  const [draftNotifyOnReveal, setDraftNotifyOnReveal] = useState(true);
+  const [editingSurpriseId, setEditingSurpriseId] = useState<string | undefined>();
   const [stepTitle, setStepTitle] = useState('');
   const [stepCity, setStepCity] = useState('');
   const [stepDate, setStepDate] = useState('2026-08-06');
   const [stepNotes, setStepNotes] = useState('');
+  const [stepMapCategory, setStepMapCategory] = useState<MapCategory>('general');
   const [stepGuideEnabled, setStepGuideEnabled] = useState(true);
   const [stepGuideStatus, setStepGuideStatus] = useState('');
   const [stepError, setStepError] = useState('');
@@ -362,6 +373,8 @@ export default function App() {
   const [editDate, setEditDate] = useState('');
   const [editNotes, setEditNotes] = useState('');
   const [editMapCategory, setEditMapCategory] = useState<MapCategory>('general');
+  const [selectedSurpriseId, setSelectedSurpriseId] = useState<string | undefined>();
+  const [surpriseCardVisible, setSurpriseCardVisible] = useState(false);
   const lastCloudSignature = useRef('');
 
   const theme = themes[themeKey];
@@ -401,7 +414,6 @@ export default function App() {
           storedDays,
           storedTodos,
           storedDocuments,
-          storedSurpriseNotifications,
         ] =
           await Promise.all([
             SecureStore.getItemAsync(THEME_KEY),
@@ -411,7 +423,6 @@ export default function App() {
             readLocalJson<TripDay[]>(DAYS_FILE),
             readLocalJson<TripTodo[]>(TODOS_FILE),
             readLocalJson<TripDocument[]>(DOCUMENTS_FILE),
-            readLocalJson<Record<string, boolean>>(SURPRISE_NOTIFICATIONS_FILE),
           ]);
 
         if (!mounted) {
@@ -459,10 +470,6 @@ export default function App() {
               : mergeRecordsWithDefaults(sampleTrip.surprises, storedSurprises),
           );
         }
-
-        if (storedSurpriseNotifications && typeof storedSurpriseNotifications === 'object') {
-          setSurpriseNotificationPrefs(storedSurpriseNotifications);
-        }
       } catch {
         setLocationStatus('Local storage unavailable');
       } finally {
@@ -486,6 +493,12 @@ export default function App() {
   }, [placeCardVisible]);
 
   useEffect(() => {
+    if (!surpriseCardVisible) {
+      setEditingSurpriseId(undefined);
+    }
+  }, [surpriseCardVisible]);
+
+  useEffect(() => {
     if (!storageReady) {
       return;
     }
@@ -496,13 +509,12 @@ export default function App() {
       writeLocalJson(DAYS_FILE, days),
       writeLocalJson(TODOS_FILE, todos),
       writeLocalJson(DOCUMENTS_FILE, documents),
-      writeLocalJson(SURPRISE_NOTIFICATIONS_FILE, surpriseNotificationPrefs),
       SecureStore.setItemAsync(THEME_KEY, themeKey),
       SecureStore.setItemAsync(DATA_VERSION_KEY, DATA_VERSION),
     ]).catch(() => {
       setLocationStatus('Could not save local app data');
     });
-  }, [days, documents, storageReady, stops, surpriseNotificationPrefs, surprises, themeKey, todos]);
+  }, [days, documents, storageReady, stops, surprises, themeKey, todos]);
 
   useEffect(() => {
     if (!storageReady) {
@@ -531,6 +543,11 @@ export default function App() {
           onMissingTrip: () => {
             if (mounted) {
               setCloudReady(true);
+            }
+          },
+          onRemotePushDevices: (devices) => {
+            if (mounted) {
+              setPushDevices(devices);
             }
           },
           onRemoteTrip: (remoteTrip) => {
@@ -602,6 +619,12 @@ export default function App() {
   }, [cloudDeviceId, cloudReady, days, documents, storageReady, stops, surprises, todos]);
 
   useEffect(() => {
+    if (cloudDeviceId && pushDevices[cloudDeviceId]?.enabled) {
+      setPushStatus('Notifications on');
+    }
+  }, [cloudDeviceId, pushDevices]);
+
+  useEffect(() => {
     if (!ownerMode && activeTab === 'studio') {
       setActiveTab('map');
     }
@@ -625,6 +648,12 @@ export default function App() {
       }).filter((surprise) => ownerMode || surprise.currentVisibility === 'revealed');
     },
     [completedStopIds, currentLocation, now, ownerMode, surprises],
+  );
+  const selectedSurprise = useMemo(
+    () =>
+      visibleSurprises.find((surprise) => surprise.id === selectedSurpriseId) ??
+      surprises.find((surprise) => surprise.id === selectedSurpriseId),
+    [selectedSurpriseId, surprises, visibleSurprises],
   );
 
   const visibleDates = useMemo(() => getRollingTripDates(trip, now, 2), [now, trip]);
@@ -737,6 +766,7 @@ export default function App() {
       revealMode: draftRevealMode,
       revealAt: draftRevealMode === 'time' ? anchor.startsAt : undefined,
       revealRadiusMeters: draftRevealMode === 'location' ? 500 : undefined,
+      notifyOnReveal: draftNotifyOnReveal,
       visibility: 'hidden',
       createdBy: 'owner',
       createdAt: new Date().toISOString(),
@@ -747,6 +777,109 @@ export default function App() {
     setDraftMessage('');
     setDraftTeaser('');
     setDraftRevealMode('manual');
+    setDraftNotifyOnReveal(true);
+  }
+
+  function beginSurpriseEdit(surprise: SurpriseStop) {
+    setEditingSurpriseId(surprise.id);
+    setDraftTitle(surprise.title);
+    setDraftMessage(surprise.message);
+    setDraftTeaser(surprise.teaser ?? '');
+    setDraftAnchorId(surprise.anchorStopId ?? trip.stops[0]?.id ?? '');
+    setDraftRevealMode(surprise.revealMode);
+    setDraftNotifyOnReveal(Boolean(surprise.notifyOnReveal));
+  }
+
+  function cancelSurpriseEdit() {
+    setEditingSurpriseId(undefined);
+    setDraftTitle('');
+    setDraftMessage('');
+    setDraftTeaser('');
+    setDraftRevealMode('manual');
+    setDraftNotifyOnReveal(true);
+  }
+
+  function saveSurpriseEdit(surpriseId: string) {
+    const title = draftTitle.trim();
+    const message = draftMessage.trim();
+
+    if (!title || !message) {
+      Alert.alert('Missing details', 'Add a title and reveal message before saving.');
+      return;
+    }
+
+    const anchor = trip.stops.find((stop) => stop.id === draftAnchorId) ?? trip.stops[0];
+
+    setSurprises((current) =>
+      current.map((surprise) =>
+        surprise.id === surpriseId
+          ? {
+              ...surprise,
+              title,
+              city: anchor?.city ?? surprise.city,
+              country: anchor?.country ?? surprise.country,
+              anchorStopId: anchor?.id,
+              coordinates: anchor
+                ? offsetCoordinates(anchor.coordinates, current.findIndex((item) => item.id === surpriseId))
+                : surprise.coordinates,
+              message,
+              teaser: draftTeaser.trim() || `A surprise is waiting near ${anchor?.city ?? surprise.city}.`,
+              revealMode: draftRevealMode,
+              revealAt: draftRevealMode === 'time' ? anchor?.startsAt : undefined,
+              revealRadiusMeters: draftRevealMode === 'location' ? 500 : undefined,
+              notifyOnReveal: draftNotifyOnReveal,
+            }
+          : surprise,
+      ),
+    );
+    setEditingSurpriseId(undefined);
+  }
+
+  function requestDeleteSurprise(surpriseId: string) {
+    const surprise = surprises.find((item) => item.id === surpriseId);
+
+    if (!surprise) {
+      return;
+    }
+
+    Alert.alert('Delete surprise?', `Delete ${surprise.title}?`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: () => deleteSurprise(surpriseId),
+      },
+    ]);
+  }
+
+  function deleteSurprise(surpriseId: string) {
+    setSurprises((current) => current.filter((surprise) => surprise.id !== surpriseId));
+
+    if (selectedSurpriseId === surpriseId) {
+      setSelectedSurpriseId(undefined);
+      setSurpriseCardVisible(false);
+    }
+
+    if (editingSurpriseId === surpriseId) {
+      cancelSurpriseEdit();
+    }
+  }
+
+  async function enableSurpriseNotifications() {
+    if (!cloudDeviceId) {
+      setPushStatus('Cloud sync must connect first');
+      return;
+    }
+
+    try {
+      setPushStatus('Requesting permission...');
+      const device = await registerForSurprisePushNotifications(cloudDeviceId);
+      await savePushDeviceToCloud(device);
+      setPushDevices((current) => ({ ...current, [device.deviceId]: device }));
+      setPushStatus('Notifications on');
+    } catch {
+      setPushStatus('Notifications unavailable');
+    }
   }
 
   async function addStep() {
@@ -794,7 +927,7 @@ export default function App() {
       notes,
       travelModeFromPrevious: 'car',
       mapVisibility: 'marker',
-      mapCategory: inferMapCategory(`${title} ${city}`),
+      mapCategory: stepMapCategory,
       recommendations,
       coverColor: theme.accentDark,
     };
@@ -822,6 +955,7 @@ export default function App() {
     setStepTitle('');
     setStepCity('');
     setStepNotes('');
+    setStepMapCategory('general');
     setStepGuideStatus('');
     setStepError('');
   }
@@ -829,6 +963,11 @@ export default function App() {
   function openStopCard(stopId: string) {
     setSelectedStopId(stopId);
     setPlaceCardVisible(true);
+  }
+
+  function openSurpriseCard(surpriseId: string) {
+    setSelectedSurpriseId(surpriseId);
+    setSurpriseCardVisible(true);
   }
 
   function beginStopEdit(stop: TripStop) {
@@ -923,15 +1062,37 @@ export default function App() {
     setPlaceCardVisible(false);
   }
 
-  function revealNow(surpriseId: string) {
-    setSurprises((current) => revealSurprise(current, surpriseId));
-  }
+  async function revealNow(surpriseId: string) {
+    const surprise = surprises.find((item) => item.id === surpriseId);
+    const shouldNotify = Boolean(
+      surprise?.notifyOnReveal &&
+        surprise.visibility !== 'revealed' &&
+        cloudDeviceId &&
+        Object.values(pushDevices).some((device) => device.enabled && device.deviceId !== cloudDeviceId),
+    );
 
-  function toggleSurpriseNotification(surpriseId: string) {
-    setSurpriseNotificationPrefs((current) => ({
-      ...current,
-      [surpriseId]: !current[surpriseId],
-    }));
+    setSurprises((current) => revealSurprise(current, surpriseId));
+
+    if (!surprise?.notifyOnReveal || surprise.visibility === 'revealed') {
+      return;
+    }
+
+    if (!shouldNotify || !cloudDeviceId) {
+      setPushStatus('No other notification devices yet');
+      return;
+    }
+
+    try {
+      setPushStatus('Sending surprise notification...');
+      await sendSurpriseRevealPushNotifications({
+        devices: Object.values(pushDevices),
+        senderDeviceId: cloudDeviceId,
+        surprise: { ...surprise, visibility: 'revealed' },
+      });
+      setPushStatus('Notification sent');
+    } catch {
+      setPushStatus('Notification failed');
+    }
   }
 
   async function addPdfToStop(stopId: string) {
@@ -977,6 +1138,21 @@ export default function App() {
     Linking.openURL(document.uri);
   }
 
+  async function removeDocument(documentId: string) {
+    const document = documents.find((item) => item.id === documentId);
+    setDocuments((current) => current.filter((item) => item.id !== documentId));
+
+    if (!document?.uri || !FileSystem.documentDirectory || !document.uri.startsWith(FileSystem.documentDirectory)) {
+      return;
+    }
+
+    try {
+      await FileSystem.deleteAsync(document.uri, { idempotent: true });
+    } catch {
+      setLocationStatus('Could not remove local PDF file');
+    }
+  }
+
   function toggleTodo(todoId: string) {
     setTodos((current) =>
       current.map((todo) => (todo.id === todoId ? { ...todo, done: !todo.done } : todo)),
@@ -1016,7 +1192,7 @@ export default function App() {
           secondVisibleSurprises={secondVisibleSurprises}
           selectedStop={selectedStop}
           onOpenStop={openStopCard}
-          onToggleSurpriseNotification={toggleSurpriseNotification}
+          onOpenSurprise={openSurpriseCard}
           theme={theme}
           firstVisibleDate={visibleDates[0]}
           firstVisibleDay={firstVisibleDay}
@@ -1026,7 +1202,6 @@ export default function App() {
           secondVisibleStops={secondVisibleStops}
           trip={trip}
           upcomingStop={upcomingStop}
-          surpriseNotificationPrefs={surpriseNotificationPrefs}
           visibleSurprises={visibleSurprises}
         />
       )}
@@ -1038,12 +1213,13 @@ export default function App() {
           guideEnabled={stepGuideEnabled}
           guideStatus={stepGuideStatus}
           onOpenStop={openStopCard}
-          onToggleSurpriseNotification={toggleSurpriseNotification}
+          onOpenSurprise={openSurpriseCard}
           ownerMode={ownerMode}
           planPanel={planPanel}
           setCalendarMode={setCalendarMode}
           setGuideEnabled={setStepGuideEnabled}
           setPlanPanel={setPlanPanel}
+          setStepMapCategory={setStepMapCategory}
           setStepCity={setStepCity}
           setStepDate={setStepDate}
           setStepNotes={setStepNotes}
@@ -1051,9 +1227,9 @@ export default function App() {
           stepCity={stepCity}
           stepDate={stepDate}
           stepError={stepError}
+          stepMapCategory={stepMapCategory}
           stepNotes={stepNotes}
           stepTitle={stepTitle}
-          surpriseNotificationPrefs={surpriseNotificationPrefs}
           theme={theme}
           trip={trip}
           visibleSurprises={visibleSurprises}
@@ -1072,13 +1248,17 @@ export default function App() {
           addSurprise={addSurprise}
           draftAnchorId={draftAnchorId}
           draftMessage={draftMessage}
+          draftNotifyOnReveal={draftNotifyOnReveal}
           draftRevealMode={draftRevealMode}
           draftTeaser={draftTeaser}
           draftTitle={draftTitle}
+          onDeleteSurprise={requestDeleteSurprise}
+          onOpenSurprise={openSurpriseCard}
           ownerMode={ownerMode}
           revealNow={revealNow}
           setDraftAnchorId={setDraftAnchorId}
           setDraftMessage={setDraftMessage}
+          setDraftNotifyOnReveal={setDraftNotifyOnReveal}
           setDraftRevealMode={setDraftRevealMode}
           setDraftTeaser={setDraftTeaser}
           setDraftTitle={setDraftTitle}
@@ -1134,6 +1314,7 @@ export default function App() {
         onClose={() => setPlaceCardVisible(false)}
         onDeleteStop={requestDeleteStop}
         openDocument={openDocument}
+        removeDocument={removeDocument}
         onSaveEdit={saveStopEdit}
         onStartEdit={beginStopEdit}
         setEditCity={setEditCity}
@@ -1146,9 +1327,38 @@ export default function App() {
         visible={placeCardVisible}
       />
 
+      <SurpriseCardModal
+        draftAnchorId={draftAnchorId}
+        draftMessage={draftMessage}
+        draftNotifyOnReveal={draftNotifyOnReveal}
+        draftRevealMode={draftRevealMode}
+        draftTeaser={draftTeaser}
+        draftTitle={draftTitle}
+        isEditing={selectedSurprise?.id === editingSurpriseId}
+        onCancelEdit={cancelSurpriseEdit}
+        onClose={() => setSurpriseCardVisible(false)}
+        onDeleteSurprise={requestDeleteSurprise}
+        onReveal={revealNow}
+        onSaveEdit={saveSurpriseEdit}
+        onStartEdit={beginSurpriseEdit}
+        ownerMode={ownerMode}
+        setDraftAnchorId={setDraftAnchorId}
+        setDraftMessage={setDraftMessage}
+        setDraftNotifyOnReveal={setDraftNotifyOnReveal}
+        setDraftRevealMode={setDraftRevealMode}
+        setDraftTeaser={setDraftTeaser}
+        setDraftTitle={setDraftTitle}
+        surprise={selectedSurprise}
+        theme={theme}
+        trip={trip}
+        visible={surpriseCardVisible}
+      />
+
       <SettingsModal
+        onEnableNotifications={enableSurpriseNotifications}
         onClose={closeSettings}
         onHiddenGestureStep={handleOwnerGestureStep}
+        pushStatus={pushStatus}
         setThemeKey={setThemeKey}
         syncStatus={cloudSyncStatus}
         theme={theme}
@@ -1177,7 +1387,7 @@ function MapScreen({
   firstVisibleStops,
   locationStatus,
   onOpenStop,
-  onToggleSurpriseNotification,
+  onOpenSurprise,
   ownerMode,
   requestLocation,
   secondVisibleDate,
@@ -1185,7 +1395,6 @@ function MapScreen({
   secondVisibleSurprises,
   secondVisibleStops,
   selectedStop,
-  surpriseNotificationPrefs,
   theme,
   trip,
   upcomingStop,
@@ -1198,7 +1407,7 @@ function MapScreen({
   firstVisibleStops: TripStop[];
   locationStatus: string;
   onOpenStop: (stopId: string) => void;
-  onToggleSurpriseNotification: (surpriseId: string) => void;
+  onOpenSurprise: (surpriseId: string) => void;
   ownerMode: boolean;
   requestLocation: () => void;
   secondVisibleDate: string;
@@ -1206,7 +1415,6 @@ function MapScreen({
   secondVisibleSurprises: RevealedSurprise[];
   secondVisibleStops: TripStop[];
   selectedStop?: TripStop;
-  surpriseNotificationPrefs: Record<string, boolean>;
   theme: (typeof themes)[ThemeKey];
   trip: Trip;
   upcomingStop?: TripStop;
@@ -1261,6 +1469,7 @@ function MapScreen({
                   surprise.currentVisibility === 'revealed' ? surprise.message : surprise.teaser
                 }
                 key={surprise.id}
+                onPress={() => onOpenSurprise(surprise.id)}
                 title={surprise.currentVisibility === 'revealed' ? surprise.title : 'Locked surprise'}
                 tracksViewChanges={false}
               >
@@ -1332,10 +1541,9 @@ function MapScreen({
         day={firstVisibleDay}
         emptyText="No planned trip places on this date."
         onOpenStop={onOpenStop}
-        onToggleSurpriseNotification={onToggleSurpriseNotification}
+        onOpenSurprise={onOpenSurprise}
         ownerMode={ownerMode}
         stops={firstVisibleStops}
-        surpriseNotificationPrefs={surpriseNotificationPrefs}
         surprises={firstVisibleSurprises}
         theme={theme}
       />
@@ -1344,10 +1552,9 @@ function MapScreen({
         day={secondVisibleDay}
         emptyText="No planned trip places on this date."
         onOpenStop={onOpenStop}
-        onToggleSurpriseNotification={onToggleSurpriseNotification}
+        onOpenSurprise={onOpenSurprise}
         ownerMode={ownerMode}
         stops={secondVisibleStops}
-        surpriseNotificationPrefs={surpriseNotificationPrefs}
         surprises={secondVisibleSurprises}
         theme={theme}
       />
@@ -1366,6 +1573,7 @@ function SelectedStopCard({
   isEditing,
   onCancelEdit,
   openDocument,
+  removeDocument,
   onSaveEdit,
   setEditCity,
   setEditDate,
@@ -1385,6 +1593,7 @@ function SelectedStopCard({
   isEditing: boolean;
   onCancelEdit: () => void;
   openDocument: (document: TripDocument) => void;
+  removeDocument: (documentId: string) => void;
   onSaveEdit: (stopId: string) => void;
   setEditCity: (value: string) => void;
   setEditDate: (value: string) => void;
@@ -1553,23 +1762,34 @@ function SelectedStopCard({
         <Text style={[styles.compactMeta, { color: theme.muted }]}>No PDFs attached yet.</Text>
       ) : (
         documents.map((document) => (
-          <Pressable
-            accessibilityRole="button"
+          <View
             key={document.id}
-            onPress={() => openDocument(document)}
             style={[styles.documentCard, { backgroundColor: theme.softSurface }]}
           >
-            <Text style={styles.documentIcon}>PDF</Text>
-            <View style={styles.flexOne}>
-              <Text style={[styles.compactTitle, { color: theme.text }]} numberOfLines={1}>
-                {document.name}
-              </Text>
-              <Text style={[styles.compactMeta, { color: theme.muted }]}>
-                Added {formatDate(document.addedAt.slice(0, 10))}
-              </Text>
-            </View>
-            <ExternalLink size={16} color={theme.text} />
-          </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => openDocument(document)}
+              style={styles.documentOpenArea}
+            >
+              <Text style={styles.documentIcon}>PDF</Text>
+              <View style={styles.flexOne}>
+                <Text style={[styles.compactTitle, { color: theme.text }]} numberOfLines={1}>
+                  {document.name}
+                </Text>
+                <Text style={[styles.compactMeta, { color: theme.muted }]}>
+                  Added {formatDate(document.addedAt.slice(0, 10))}
+                </Text>
+              </View>
+              <ExternalLink size={16} color={theme.text} />
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => removeDocument(document.id)}
+              style={styles.documentDeleteButton}
+            >
+              <Trash2 size={16} color="#C5392D" />
+            </Pressable>
+          </View>
         ))
       )}
 
@@ -1629,6 +1849,7 @@ function PlaceCardModal({
   onClose,
   onDeleteStop,
   openDocument,
+  removeDocument,
   onSaveEdit,
   onStartEdit,
   setEditCity,
@@ -1652,6 +1873,7 @@ function PlaceCardModal({
   onClose: () => void;
   onDeleteStop: (stopId: string) => void;
   openDocument: (document: TripDocument) => void;
+  removeDocument: (documentId: string) => void;
   onSaveEdit: (stopId: string) => void;
   onStartEdit: (stop: TripStop) => void;
   setEditCity: (value: string) => void;
@@ -1678,7 +1900,12 @@ function PlaceCardModal({
   return (
     <Modal animationType="slide" transparent visible={visible}>
       <View style={styles.modalBackdrop}>
-        <View style={[styles.placeModalPanel, { backgroundColor: theme.surface }]}>
+        <View
+          style={[
+            styles.placeModalPanel,
+            { backgroundColor: theme.surface, marginTop: Platform.OS === 'ios' ? 36 : 18 },
+          ]}
+        >
           <View style={styles.modalHandle} />
           <View style={styles.modalActionCluster}>
             <Pressable
@@ -1734,6 +1961,7 @@ function PlaceCardModal({
               isEditing={isEditing}
               onCancelEdit={onCancelEdit}
               openDocument={openDocument}
+              removeDocument={removeDocument}
               onSaveEdit={onSaveEdit}
               setEditCity={setEditCity}
               setEditDate={setEditDate}
@@ -1750,15 +1978,304 @@ function PlaceCardModal({
   );
 }
 
+function SurpriseCardModal({
+  draftAnchorId,
+  draftMessage,
+  draftNotifyOnReveal,
+  draftRevealMode,
+  draftTeaser,
+  draftTitle,
+  isEditing,
+  onCancelEdit,
+  onClose,
+  onDeleteSurprise,
+  onReveal,
+  onSaveEdit,
+  onStartEdit,
+  ownerMode,
+  setDraftAnchorId,
+  setDraftMessage,
+  setDraftNotifyOnReveal,
+  setDraftRevealMode,
+  setDraftTeaser,
+  setDraftTitle,
+  surprise,
+  theme,
+  trip,
+  visible,
+}: {
+  draftAnchorId: string;
+  draftMessage: string;
+  draftNotifyOnReveal: boolean;
+  draftRevealMode: RevealMode;
+  draftTeaser: string;
+  draftTitle: string;
+  isEditing: boolean;
+  onCancelEdit: () => void;
+  onClose: () => void;
+  onDeleteSurprise: (surpriseId: string) => void;
+  onReveal: (surpriseId: string) => void;
+  onSaveEdit: (surpriseId: string) => void;
+  onStartEdit: (surprise: SurpriseStop) => void;
+  ownerMode: boolean;
+  setDraftAnchorId: (value: string) => void;
+  setDraftMessage: (value: string) => void;
+  setDraftNotifyOnReveal: (value: boolean) => void;
+  setDraftRevealMode: (value: RevealMode) => void;
+  setDraftTeaser: (value: string) => void;
+  setDraftTitle: (value: string) => void;
+  surprise?: SurpriseStop | RevealedSurprise;
+  theme: (typeof themes)[ThemeKey];
+  trip: Trip;
+  visible: boolean;
+}) {
+  const [actionsVisible, setActionsVisible] = useState(false);
+
+  useEffect(() => {
+    if (!visible) {
+      setActionsVisible(false);
+    }
+  }, [visible]);
+
+  if (!surprise) {
+    return null;
+  }
+
+  const currentVisibility =
+    'currentVisibility' in surprise
+      ? surprise.currentVisibility
+      : surprise.visibility === 'revealed'
+        ? 'revealed'
+        : 'teaser';
+  const canReadFullCard = ownerMode || currentVisibility === 'revealed';
+
+  return (
+    <Modal animationType="slide" transparent visible={visible}>
+      <View style={styles.modalBackdrop}>
+        <View
+          style={[
+            styles.surpriseModalPanel,
+            { marginTop: Platform.OS === 'ios' ? 36 : 18 },
+          ]}
+        >
+          <View style={styles.modalHandle} />
+          {ownerMode && (
+            <View style={styles.modalActionCluster}>
+              <Pressable
+                accessibilityRole="button"
+                onPress={() => setActionsVisible((current) => !current)}
+                style={[styles.modalActionButton, { backgroundColor: '#FFFFFF' }]}
+              >
+                <Pencil size={19} color="#1C1E2E" />
+              </Pressable>
+              {actionsVisible && (
+                <View style={[styles.cardActionMenu, { backgroundColor: '#FFFFFF', borderColor: '#F2C94C' }]}>
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={() => {
+                      setActionsVisible(false);
+                      onStartEdit(surprise);
+                    }}
+                    style={styles.cardActionItem}
+                  >
+                    <Pencil size={16} color="#1C1E2E" />
+                    <Text style={[styles.cardActionText, { color: '#1C1E2E' }]}>Edit</Text>
+                  </Pressable>
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={() => {
+                      setActionsVisible(false);
+                      onDeleteSurprise(surprise.id);
+                    }}
+                    style={styles.cardActionItem}
+                  >
+                    <Trash2 size={16} color="#C5392D" />
+                    <Text style={[styles.cardActionText, { color: '#C5392D' }]}>Delete</Text>
+                  </Pressable>
+                </View>
+              )}
+            </View>
+          )}
+          <Pressable
+            accessibilityRole="button"
+            onPress={onClose}
+            style={[styles.modalCloseButton, { backgroundColor: '#FFFFFF' }]}
+          >
+            <X size={20} color="#1C1E2E" />
+          </Pressable>
+          <ScrollView showsVerticalScrollIndicator={false}>
+            <View style={styles.panelHeader}>
+              <View style={styles.flexOne}>
+                <Text style={[styles.eyebrow, { color: '#5D4D13' }]}>Surprise card</Text>
+                <Text style={[styles.panelTitle, { color: '#1C1E2E' }]}>
+                  {canReadFullCard ? surprise.title : 'Locked surprise'}
+                </Text>
+              </View>
+              <View style={[styles.surprisePlanIcon, { backgroundColor: '#F2C94C' }]}>
+                <Sparkles size={19} color="#1C1E2E" />
+              </View>
+            </View>
+
+            {isEditing ? (
+              <View style={styles.editCardArea}>
+                <Text style={[styles.controlLabel, { color: '#5D4D13' }]}>Title</Text>
+                <TextInput
+                  onChangeText={setDraftTitle}
+                  placeholder="Title"
+                  placeholderTextColor="#8A92A3"
+                  style={[styles.input, { borderColor: '#F2C94C', color: '#1C1E2E', backgroundColor: '#FFFFFF' }]}
+                  value={draftTitle}
+                />
+                <Text style={[styles.controlLabel, { color: '#5D4D13' }]}>Message</Text>
+                <TextInput
+                  multiline
+                  onChangeText={setDraftMessage}
+                  placeholder="Reveal message"
+                  placeholderTextColor="#8A92A3"
+                  style={[
+                    styles.input,
+                    styles.multilineInput,
+                    { borderColor: '#F2C94C', color: '#1C1E2E', backgroundColor: '#FFFFFF' },
+                  ]}
+                  value={draftMessage}
+                />
+                <Text style={[styles.controlLabel, { color: '#5D4D13' }]}>Teaser</Text>
+                <TextInput
+                  onChangeText={setDraftTeaser}
+                  placeholder="Optional teaser"
+                  placeholderTextColor="#8A92A3"
+                  style={[styles.input, { borderColor: '#F2C94C', color: '#1C1E2E', backgroundColor: '#FFFFFF' }]}
+                  value={draftTeaser}
+                />
+                <Text style={[styles.controlLabel, { color: '#5D4D13' }]}>Reveal</Text>
+                <View style={styles.segmentRow}>
+                  {revealModes.map((mode) => (
+                    <Pressable
+                      accessibilityRole="button"
+                      key={mode.value}
+                      onPress={() => setDraftRevealMode(mode.value)}
+                      style={[
+                        styles.segment,
+                        { backgroundColor: '#FFFFFF', borderColor: '#F2C94C' },
+                        draftRevealMode === mode.value && { backgroundColor: '#1C1E2E', borderColor: '#1C1E2E' },
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.segmentText,
+                          { color: '#1C1E2E' },
+                          draftRevealMode === mode.value && { color: '#FFFFFF' },
+                        ]}
+                      >
+                        {mode.label}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+                <Text style={[styles.controlLabel, { color: '#5D4D13' }]}>Near</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.anchorScroll}>
+                  {trip.stops.slice(0, 10).map((stop) => (
+                    <Pressable
+                      accessibilityRole="button"
+                      key={stop.id}
+                      onPress={() => setDraftAnchorId(stop.id)}
+                      style={[
+                        styles.anchorChip,
+                        { backgroundColor: '#FFFFFF', borderColor: '#F2C94C' },
+                        draftAnchorId === stop.id && { backgroundColor: '#1C1E2E', borderColor: '#1C1E2E' },
+                      ]}
+                    >
+                      <Text
+                        numberOfLines={1}
+                        style={[
+                          styles.anchorChipText,
+                          { color: '#1C1E2E' },
+                          draftAnchorId === stop.id && { color: '#FFFFFF' },
+                        ]}
+                      >
+                        {stop.city}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
+                <Pressable
+                  accessibilityRole="checkbox"
+                  accessibilityState={{ checked: draftNotifyOnReveal }}
+                  onPress={() => setDraftNotifyOnReveal(!draftNotifyOnReveal)}
+                  style={[styles.guideToggle, { backgroundColor: '#FFFFFF' }]}
+                >
+                  <View
+                    style={[
+                      styles.todoCheck,
+                      { borderColor: draftNotifyOnReveal ? '#2B8C83' : '#F2C94C' },
+                      draftNotifyOnReveal && { backgroundColor: '#2B8C83' },
+                    ]}
+                  >
+                    {draftNotifyOnReveal && <Check size={16} color="#FFFFFF" />}
+                  </View>
+                  <View style={styles.flexOne}>
+                    <Text style={[styles.compactTitle, { color: '#1C1E2E' }]}>
+                      Notify other phones when revealed
+                    </Text>
+                    <Text style={[styles.compactMeta, { color: '#5D4D13' }]}>
+                      Uses the Expo push token of opted-in phones.
+                    </Text>
+                  </View>
+                </Pressable>
+                <View style={styles.editActionRow}>
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={() => onSaveEdit(surprise.id)}
+                    style={[styles.editSaveButton, { backgroundColor: '#1C1E2E' }]}
+                  >
+                    <Save size={16} color="#FFFFFF" />
+                    <Text style={[styles.revealButtonText, { color: '#FFFFFF' }]}>Save</Text>
+                  </Pressable>
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={onCancelEdit}
+                    style={[styles.editCancelButton, { backgroundColor: '#FFFFFF' }]}
+                  >
+                    <X size={16} color="#1C1E2E" />
+                    <Text style={[styles.revealButtonText, { color: '#1C1E2E' }]}>Cancel</Text>
+                  </Pressable>
+                </View>
+              </View>
+            ) : (
+              <>
+                <Text style={[styles.placeNotesText, { color: '#1C1E2E', backgroundColor: '#FFFFFF' }]}>
+                  {canReadFullCard ? surprise.message : surprise.teaser ?? 'Something is waiting.'}
+                </Text>
+                <Text style={[styles.addressText, { color: '#1C1E2E' }]}>
+                  {surprise.city} - {surprise.revealMode}
+                </Text>
+                {ownerMode && surprise.visibility !== 'revealed' && (
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={() => onReveal(surprise.id)}
+                    style={[styles.revealButton, { backgroundColor: '#1C1E2E' }]}
+                  >
+                    <Check size={16} color="#FFFFFF" />
+                    <Text style={[styles.revealButtonText, { color: '#FFFFFF' }]}>Reveal now</Text>
+                  </Pressable>
+                )}
+              </>
+            )}
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 function DayPlanSection({
   date,
   day,
   emptyText,
   onOpenStop,
-  onToggleSurpriseNotification,
+  onOpenSurprise,
   ownerMode,
   stops,
-  surpriseNotificationPrefs,
   surprises,
   theme,
 }: {
@@ -1766,10 +2283,9 @@ function DayPlanSection({
   day?: TripDay;
   emptyText: string;
   onOpenStop: (stopId: string) => void;
-  onToggleSurpriseNotification: (surpriseId: string) => void;
+  onOpenSurprise: (surpriseId: string) => void;
   ownerMode: boolean;
   stops: TripStop[];
-  surpriseNotificationPrefs: Record<string, boolean>;
   surprises: RevealedSurprise[];
   theme: (typeof themes)[ThemeKey];
 }) {
@@ -1798,11 +2314,9 @@ function DayPlanSection({
           {surprises.map((surprise) => (
             <SurprisePlanCard
               key={surprise.id}
-              notifyEnabled={Boolean(surpriseNotificationPrefs[surprise.id])}
-              onToggleNotification={() => onToggleSurpriseNotification(surprise.id)}
+              onPress={() => onOpenSurprise(surprise.id)}
               ownerMode={ownerMode}
               surprise={surprise}
-              theme={theme}
             />
           ))}
         </>
@@ -1812,20 +2326,21 @@ function DayPlanSection({
 }
 
 function SurprisePlanCard({
-  notifyEnabled,
-  onToggleNotification,
+  onPress,
   ownerMode,
   surprise,
-  theme,
 }: {
-  notifyEnabled: boolean;
-  onToggleNotification: () => void;
+  onPress?: () => void;
   ownerMode: boolean;
   surprise: RevealedSurprise;
-  theme: (typeof themes)[ThemeKey];
 }) {
   return (
-    <View style={[styles.surprisePlanCard, { borderColor: '#F2C94C' }]}>
+    <Pressable
+      accessibilityRole="button"
+      disabled={!onPress}
+      onPress={onPress}
+      style={[styles.surprisePlanCard, { borderColor: '#F2C94C' }]}
+    >
       <View style={[styles.surprisePlanIcon, { backgroundColor: '#F2C94C' }]}>
         <Sparkles size={18} color="#1C1E2E" />
       </View>
@@ -1838,30 +2353,16 @@ function SurprisePlanCard({
             ? surprise.message
             : surprise.teaser ?? 'Something is waiting.'}
         </Text>
-        {!ownerMode && (
-          <Pressable
-            accessibilityRole="button"
-            onPress={onToggleNotification}
-            style={[styles.notifyButton, { backgroundColor: notifyEnabled ? theme.text : '#FFFFFF' }]}
-          >
-            <Text
-              style={[
-                styles.notifyButtonText,
-                { color: notifyEnabled ? theme.surface : theme.text },
-              ]}
-            >
-              {notifyEnabled ? 'Notifications on' : 'Notify me'}
-            </Text>
-          </Pressable>
-        )}
+        {!ownerMode && <Text style={[styles.compactMeta, { color: '#5D4D13' }]}>Surprise alert</Text>}
       </View>
-    </View>
+    </Pressable>
   );
 }
 
 function CalendarSection({
   mode,
   onOpenStop,
+  onOpenSurprise,
   setMode,
   theme,
   trip,
@@ -1870,6 +2371,7 @@ function CalendarSection({
 }: {
   mode: CalendarMode;
   onOpenStop: (stopId: string) => void;
+  onOpenSurprise: (surpriseId: string) => void;
   setMode: (mode: CalendarMode) => void;
   theme: (typeof themes)[ThemeKey];
   trip: Trip;
@@ -1931,19 +2433,24 @@ function CalendarSection({
                   accessibilityRole="button"
                   key={stop.id}
                   onPress={() => onOpenStop(stop.id)}
-                  style={styles.calendarStop}
+                  style={[styles.calendarStop, { backgroundColor: theme.softSurface }]}
                 >
                   <Text style={styles.calendarStopEmoji}>{getStopEmoji(stop)}</Text>
                   <Text style={[styles.compactMeta, { color: theme.muted }]}>{stop.title}</Text>
                 </Pressable>
               ))}
               {getSurprisesForDate(visibleSurprises, day.date, trip.stops).map((surprise) => (
-                <View key={surprise.id} style={styles.calendarStop}>
+                <Pressable
+                  accessibilityRole="button"
+                  key={surprise.id}
+                  onPress={() => onOpenSurprise(surprise.id)}
+                  style={[styles.calendarStop, styles.calendarSurpriseStop]}
+                >
                   <Text style={styles.calendarStopEmoji}>✨</Text>
-                  <Text style={[styles.compactMeta, { color: theme.accentDark }]}>
+                  <Text style={[styles.compactMeta, { color: '#5D4D13' }]}>
                     {surprise.currentVisibility === 'revealed' ? surprise.title : 'Locked surprise'}
                   </Text>
-                </View>
+                </Pressable>
               ))}
             </View>
           </View>
@@ -2002,12 +2509,13 @@ function TimelineScreen({
   guideEnabled,
   guideStatus,
   onOpenStop,
-  onToggleSurpriseNotification,
+  onOpenSurprise,
   ownerMode,
   planPanel,
   setCalendarMode,
   setGuideEnabled,
   setPlanPanel,
+  setStepMapCategory,
   setStepCity,
   setStepDate,
   setStepNotes,
@@ -2015,9 +2523,9 @@ function TimelineScreen({
   stepCity,
   stepDate,
   stepError,
+  stepMapCategory,
   stepNotes,
   stepTitle,
-  surpriseNotificationPrefs,
   theme,
   trip,
   visibleSurprises,
@@ -2028,12 +2536,13 @@ function TimelineScreen({
   guideEnabled: boolean;
   guideStatus: string;
   onOpenStop: (stopId: string) => void;
-  onToggleSurpriseNotification: (surpriseId: string) => void;
+  onOpenSurprise: (surpriseId: string) => void;
   ownerMode: boolean;
   planPanel: PlanPanel;
   setCalendarMode: (mode: CalendarMode) => void;
   setGuideEnabled: (value: boolean) => void;
   setPlanPanel: (panel: PlanPanel) => void;
+  setStepMapCategory: (value: MapCategory) => void;
   setStepCity: (value: string) => void;
   setStepDate: (value: string) => void;
   setStepNotes: (value: string) => void;
@@ -2041,9 +2550,9 @@ function TimelineScreen({
   stepCity: string;
   stepDate: string;
   stepError: string;
+  stepMapCategory: MapCategory;
   stepNotes: string;
   stepTitle: string;
-  surpriseNotificationPrefs: Record<string, boolean>;
   theme: (typeof themes)[ThemeKey];
   trip: Trip;
   visibleSurprises: RevealedSurprise[];
@@ -2082,6 +2591,7 @@ function TimelineScreen({
         <CalendarSection
           mode={calendarMode}
           onOpenStop={onOpenStop}
+          onOpenSurprise={onOpenSurprise}
           setMode={setCalendarMode}
           theme={theme}
           trip={trip}
@@ -2129,6 +2639,35 @@ function TimelineScreen({
                 value={stepDate}
               />
             </View>
+            <Text style={[styles.controlLabel, { color: theme.muted }]}>Icon</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.categoryEditRail}>
+              {editableMapCategories.map((item) => (
+                <Pressable
+                  accessibilityRole="button"
+                  key={item.category}
+                  onPress={() => setStepMapCategory(item.category)}
+                  style={[
+                    styles.categoryEditChip,
+                    { backgroundColor: theme.softSurface, borderColor: theme.border },
+                    stepMapCategory === item.category && {
+                      backgroundColor: theme.text,
+                      borderColor: theme.text,
+                    },
+                  ]}
+                >
+                  <Text style={styles.legendEmoji}>{getMapCategoryEmoji(item.category)}</Text>
+                  <Text
+                    style={[
+                      styles.legendText,
+                      { color: theme.text },
+                      stepMapCategory === item.category && { color: theme.surface },
+                    ]}
+                  >
+                    {item.label}
+                  </Text>
+                </Pressable>
+              ))}
+            </ScrollView>
             <TextInput
               multiline
               onChangeText={setStepNotes}
@@ -2206,7 +2745,9 @@ function TimelineScreen({
                         { backgroundColor: theme.softSurface, borderColor: theme.border },
                       ]}
                     >
-                      <View style={[styles.compactDot, { backgroundColor: stop.coverColor }]} />
+                      <View style={[styles.compactEmojiBadge, { backgroundColor: stop.coverColor }]}>
+                        <Text style={styles.compactEmoji}>{getStopEmoji(stop)}</Text>
+                      </View>
                       <View style={styles.compactText}>
                         <Text style={[styles.compactTitle, { color: theme.text }]}>{stop.title}</Text>
                         <Text style={[styles.compactMeta, { color: theme.muted }]}>
@@ -2219,11 +2760,9 @@ function TimelineScreen({
                   {daySurprises.map((surprise) => (
                     <SurprisePlanCard
                       key={surprise.id}
-                      notifyEnabled={Boolean(surpriseNotificationPrefs[surprise.id])}
-                      onToggleNotification={() => onToggleSurpriseNotification(surprise.id)}
+                      onPress={() => onOpenSurprise(surprise.id)}
                       ownerMode={ownerMode}
                       surprise={surprise}
-                      theme={theme}
                     />
                   ))}
                 </View>
@@ -2240,13 +2779,17 @@ function MomentsScreen({
   addSurprise,
   draftAnchorId,
   draftMessage,
+  draftNotifyOnReveal,
   draftRevealMode,
   draftTeaser,
   draftTitle,
+  onDeleteSurprise,
+  onOpenSurprise,
   ownerMode,
   revealNow,
   setDraftAnchorId,
   setDraftMessage,
+  setDraftNotifyOnReveal,
   setDraftRevealMode,
   setDraftTeaser,
   setDraftTitle,
@@ -2257,13 +2800,17 @@ function MomentsScreen({
   addSurprise: () => void;
   draftAnchorId: string;
   draftMessage: string;
+  draftNotifyOnReveal: boolean;
   draftRevealMode: RevealMode;
   draftTeaser: string;
   draftTitle: string;
+  onDeleteSurprise: (surpriseId: string) => void;
+  onOpenSurprise: (surpriseId: string) => void;
   ownerMode: boolean;
   revealNow: (surpriseId: string) => void;
   setDraftAnchorId: (value: string) => void;
   setDraftMessage: (value: string) => void;
+  setDraftNotifyOnReveal: (value: boolean) => void;
   setDraftRevealMode: (value: RevealMode) => void;
   setDraftTeaser: (value: string) => void;
   setDraftTitle: (value: string) => void;
@@ -2362,6 +2909,30 @@ function MomentsScreen({
             ))}
           </ScrollView>
           <Pressable
+            accessibilityRole="checkbox"
+            accessibilityState={{ checked: draftNotifyOnReveal }}
+            onPress={() => setDraftNotifyOnReveal(!draftNotifyOnReveal)}
+            style={[styles.guideToggle, { backgroundColor: theme.surface }]}
+          >
+            <View
+              style={[
+                styles.todoCheck,
+                { borderColor: draftNotifyOnReveal ? theme.accentDark : theme.border },
+                draftNotifyOnReveal && { backgroundColor: theme.accentDark },
+              ]}
+            >
+              {draftNotifyOnReveal && <Check size={16} color="#FFFFFF" />}
+            </View>
+            <View style={styles.flexOne}>
+              <Text style={[styles.compactTitle, { color: theme.text }]}>
+                Notify other phones when revealed
+              </Text>
+              <Text style={[styles.compactMeta, { color: theme.muted }]}>
+                Sends a push only after the surprise is revealed.
+              </Text>
+            </View>
+          </Pressable>
+          <Pressable
             accessibilityRole="button"
             disabled={!canAdd}
             onPress={addSurprise}
@@ -2401,8 +2972,10 @@ function MomentsScreen({
       )}
 
       {visibleSurprises.map((surprise) => (
-        <View
+        <Pressable
+          accessibilityRole="button"
           key={surprise.id}
+          onPress={() => onOpenSurprise(surprise.id)}
           style={[styles.surpriseCard, { backgroundColor: theme.surface, borderColor: theme.border }]}
         >
           <View style={[styles.surpriseIcon, { backgroundColor: theme.accent }]}>
@@ -2434,21 +3007,35 @@ function MomentsScreen({
                 <Text style={[styles.revealButtonText, { color: theme.surface }]}>Reveal now</Text>
               </Pressable>
             )}
+            {ownerMode && (
+              <Pressable
+                accessibilityRole="button"
+                onPress={() => onDeleteSurprise(surprise.id)}
+                style={[styles.revealButton, { backgroundColor: '#C5392D' }]}
+              >
+                <Trash2 size={16} color="#FFFFFF" />
+                <Text style={[styles.revealButtonText, { color: '#FFFFFF' }]}>Delete</Text>
+              </Pressable>
+            )}
           </View>
-        </View>
+        </Pressable>
       ))}
     </ScrollView>
   );
 }
 
 function SettingsScreen({
+  onEnableNotifications,
   onHiddenGestureStep,
+  pushStatus,
   setThemeKey,
   syncStatus,
   theme,
   themeKey,
 }: {
+  onEnableNotifications: () => void;
   onHiddenGestureStep: (step: string) => void;
+  pushStatus: string;
   setThemeKey: (themeKey: ThemeKey) => void;
   syncStatus: string;
   theme: (typeof themes)[ThemeKey];
@@ -2500,21 +3087,37 @@ function SettingsScreen({
         <Text style={[styles.eyebrow, { color: theme.muted }]}>Sync</Text>
         <Text style={[styles.compactTitle, { color: theme.text }]}>{syncStatus}</Text>
       </View>
+      <View style={[styles.primaryPanel, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+        <Text style={[styles.eyebrow, { color: theme.muted }]}>Notifications</Text>
+        <Text style={[styles.compactTitle, { color: theme.text }]}>{pushStatus}</Text>
+        <Pressable
+          accessibilityRole="button"
+          onPress={onEnableNotifications}
+          style={[styles.addButton, { backgroundColor: theme.text }]}
+        >
+          <Sparkles size={18} color={theme.surface} />
+          <Text style={[styles.addButtonText, { color: theme.surface }]}>Enable surprise alerts</Text>
+        </Pressable>
+      </View>
     </ScrollView>
   );
 }
 
 function SettingsModal({
+  onEnableNotifications,
   onClose,
   onHiddenGestureStep,
+  pushStatus,
   setThemeKey,
   syncStatus,
   theme,
   themeKey,
   visible,
 }: {
+  onEnableNotifications: () => void;
   onClose: () => void;
   onHiddenGestureStep: (step: string) => void;
+  pushStatus: string;
   setThemeKey: (themeKey: ThemeKey) => void;
   syncStatus: string;
   theme: (typeof themes)[ThemeKey];
@@ -2536,7 +3139,9 @@ function SettingsModal({
             </Pressable>
           </View>
           <SettingsScreen
+            onEnableNotifications={onEnableNotifications}
             onHiddenGestureStep={onHiddenGestureStep}
+            pushStatus={pushStatus}
             setThemeKey={setThemeKey}
             syncStatus={syncStatus}
             theme={theme}
@@ -2568,6 +3173,9 @@ function StopCard({
       ]}
     >
       <View style={[styles.stopColor, { backgroundColor: stop.coverColor }]} />
+      <View style={[styles.stopCardIcon, { backgroundColor: stop.coverColor }]}>
+        <Text style={styles.stopCardEmoji}>{getStopEmoji(stop)}</Text>
+      </View>
       <View style={styles.stopCardBody}>
         <View style={styles.stopTitleRow}>
           <Text style={[styles.stopTitle, { color: theme.text }]}>{stop.title}</Text>
@@ -2964,6 +3572,10 @@ function toTitleCase(value: string) {
 }
 
 function getStopEmoji(stop: TripStop) {
+  if (stop.travelModeFromPrevious === 'flight' || stop.mapCategory === 'travel') {
+    return '✈️';
+  }
+
   return getMapCategoryEmoji(stop.mapCategory ?? inferMapCategory(`${stop.title} ${stop.city}`), stop);
 }
 
@@ -3174,12 +3786,19 @@ const styles = StyleSheet.create({
   },
   calendarStop: {
     alignItems: 'center',
+    borderRadius: 8,
     flexDirection: 'row',
     gap: 6,
     marginTop: 5,
+    minHeight: 32,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
   },
   calendarStopEmoji: {
     fontSize: 15,
+  },
+  calendarSurpriseStop: {
+    backgroundColor: '#FFF3B0',
   },
   cardActionItem: {
     alignItems: 'center',
@@ -3215,11 +3834,15 @@ const styles = StyleSheet.create({
   categoryEditRail: {
     marginTop: 8,
   },
-  compactDot: {
-    borderRadius: 5,
-    height: 10,
-    marginTop: 5,
-    width: 10,
+  compactEmoji: {
+    fontSize: 16,
+  },
+  compactEmojiBadge: {
+    alignItems: 'center',
+    borderRadius: 8,
+    height: 30,
+    justifyContent: 'center',
+    width: 30,
   },
   compactMeta: {
     flexShrink: 1,
@@ -3323,7 +3946,15 @@ const styles = StyleSheet.create({
     gap: 10,
     marginTop: 8,
     minHeight: 48,
-    paddingHorizontal: 12,
+    paddingLeft: 12,
+    paddingRight: 8,
+  },
+  documentDeleteButton: {
+    alignItems: 'center',
+    borderRadius: 8,
+    height: 34,
+    justifyContent: 'center',
+    width: 34,
   },
   documentHeader: {
     alignItems: 'center',
@@ -3335,6 +3966,13 @@ const styles = StyleSheet.create({
     color: '#C5392D',
     fontSize: 12,
     fontWeight: '900',
+  },
+  documentOpenArea: {
+    alignItems: 'center',
+    flex: 1,
+    flexDirection: 'row',
+    gap: 10,
+    minHeight: 48,
   },
   editActionRow: {
     flexDirection: 'row',
@@ -3610,7 +4248,7 @@ const styles = StyleSheet.create({
   },
   placeModalPanel: {
     borderRadius: 8,
-    maxHeight: '92%',
+    maxHeight: '88%',
     padding: 16,
     width: '94%',
   },
@@ -3779,6 +4417,7 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
   },
   stopCard: {
+    alignItems: 'flex-start',
     borderRadius: 8,
     borderWidth: 1,
     flexDirection: 'row',
@@ -3790,6 +4429,18 @@ const styles = StyleSheet.create({
   },
   stopColor: {
     width: 7,
+  },
+  stopCardEmoji: {
+    fontSize: 18,
+  },
+  stopCardIcon: {
+    alignItems: 'center',
+    borderRadius: 8,
+    height: 36,
+    justifyContent: 'center',
+    marginLeft: 12,
+    marginTop: 14,
+    width: 36,
   },
   stopPhoto: {
     backgroundColor: '#D9DEE8',
@@ -3841,6 +4492,13 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '900',
     marginBottom: 4,
+  },
+  surpriseModalPanel: {
+    backgroundColor: '#FFF3B0',
+    borderRadius: 8,
+    maxHeight: '88%',
+    padding: 16,
+    width: '94%',
   },
   tabBar: {
     borderRadius: 8,

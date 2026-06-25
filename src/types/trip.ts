@@ -111,6 +111,7 @@ export type SurpriseStop = {
   revealAt?: string;
   revealRadiusMeters?: number;
   afterStopId?: string;
+  notifyOnReveal?: boolean;
   visibility: SurpriseVisibility;
   createdBy: 'owner';
   createdAt: string;

@@ -1,4 +1,5 @@
-import { FirebaseOptions, getApps, initializeApp } from 'firebase/app';
+import { getApps, initializeApp } from 'firebase/app';
+import type { FirebaseOptions } from 'firebase/app';
 import { getAuth, signInAnonymously } from 'firebase/auth';
 import {
   doc,
@@ -15,6 +16,7 @@ import {
   TripStop,
   TripTodo,
 } from '../types/trip';
+import type { PushDevice } from './pushNotifications';
 
 declare const process: {
   env: {
@@ -39,6 +41,7 @@ export type CloudTripData = {
 
 type CloudTripDocument = {
   dataVersion?: string;
+  pushDevices?: Record<string, PushDevice>;
   trip?: CloudTripData;
   updatedByDeviceId?: string;
 };
@@ -46,6 +49,7 @@ type CloudTripDocument = {
 type StartCloudSyncOptions = {
   deviceId: string;
   onMissingTrip: () => void;
+  onRemotePushDevices: (devices: Record<string, PushDevice>) => void;
   onRemoteTrip: (trip: CloudTripData) => void;
   onStatus: (status: string) => void;
 };
@@ -64,6 +68,7 @@ export function isFirebaseSyncConfigured() {
 export async function startTripCloudSync({
   deviceId,
   onMissingTrip,
+  onRemotePushDevices,
   onRemoteTrip,
   onStatus,
 }: StartCloudSyncOptions): Promise<() => void> {
@@ -85,6 +90,7 @@ export async function startTripCloudSync({
       }
 
       const data = snapshot.data() as CloudTripDocument;
+      onRemotePushDevices(data.pushDevices ?? {});
 
       if (data.updatedByDeviceId === deviceId) {
         onStatus('Cloud synced');
@@ -94,6 +100,9 @@ export async function startTripCloudSync({
       if (data.trip) {
         onRemoteTrip(data.trip);
         onStatus('Cloud synced');
+      } else {
+        onStatus('Cloud ready');
+        onMissingTrip();
       }
     },
     () => {
@@ -113,6 +122,22 @@ export async function saveTripToCloud(trip: CloudTripData, deviceId: string) {
       trip,
       updatedAt: serverTimestamp(),
       updatedByDeviceId: deviceId,
+    },
+    { merge: true },
+  );
+}
+
+export async function savePushDeviceToCloud(device: PushDevice) {
+  const app = getFirebaseApp();
+  const db = getFirestore(app);
+
+  await setDoc(
+    doc(db, 'trips', getTripDocumentId()),
+    {
+      pushDevices: {
+        [device.deviceId]: device,
+      },
+      updatedAt: serverTimestamp(),
     },
     { merge: true },
   );
