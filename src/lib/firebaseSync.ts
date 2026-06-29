@@ -92,11 +92,6 @@ export async function startTripCloudSync({
       const data = snapshot.data() as CloudTripDocument;
       onRemotePushDevices(data.pushDevices ?? {});
 
-      if (data.updatedByDeviceId === deviceId) {
-        onStatus('Cloud synced');
-        return;
-      }
-
       if (data.trip) {
         onRemoteTrip(data.trip);
         onStatus('Cloud synced');

@@ -56,6 +56,7 @@ import {
   getTripDayByDate,
   getStopsForDay,
   getUpcomingStop,
+  distanceMeters,
   offsetCoordinates,
   resolvePlaceCoordinates,
 } from './src/lib/itinerary';
@@ -104,6 +105,14 @@ type TabKey = 'map' | 'timeline' | 'todo' | 'studio';
 type ThemeKey = 'light' | 'dark' | 'lilac' | 'green' | 'blue';
 type CalendarMode = 'week' | 'month';
 type PlanPanel = 'calendar' | 'new';
+
+type PlaceSuggestion = {
+  address?: string;
+  coordinates: Coordinates;
+  googleMapsUri?: string;
+  id: string;
+  name: string;
+};
 
 const THEME_KEY = 'roundtrip.theme.v1';
 const DATA_VERSION_KEY = 'roundtrip.dataVersion.v1';
@@ -364,6 +373,8 @@ export default function App() {
   const [stepDate, setStepDate] = useState('2026-08-06');
   const [stepNotes, setStepNotes] = useState('');
   const [stepMapCategory, setStepMapCategory] = useState<MapCategory>('general');
+  const [stepPlaceSuggestions, setStepPlaceSuggestions] = useState<PlaceSuggestion[]>([]);
+  const [stepSelectedPlace, setStepSelectedPlace] = useState<PlaceSuggestion | undefined>();
   const [stepGuideEnabled, setStepGuideEnabled] = useState(true);
   const [stepGuideStatus, setStepGuideStatus] = useState('');
   const [stepError, setStepError] = useState('');
@@ -373,6 +384,8 @@ export default function App() {
   const [editDate, setEditDate] = useState('');
   const [editNotes, setEditNotes] = useState('');
   const [editMapCategory, setEditMapCategory] = useState<MapCategory>('general');
+  const [editPlaceSuggestions, setEditPlaceSuggestions] = useState<PlaceSuggestion[]>([]);
+  const [editSelectedPlace, setEditSelectedPlace] = useState<PlaceSuggestion | undefined>();
   const [selectedSurpriseId, setSelectedSurpriseId] = useState<string | undefined>();
   const [surpriseCardVisible, setSurpriseCardVisible] = useState(false);
   const lastCloudSignature = useRef('');
@@ -613,10 +626,68 @@ export default function App() {
         .catch(() => {
           setCloudSyncStatus('Cloud save failed');
         });
-    }, 1000);
+    }, 300);
 
     return () => clearTimeout(timer);
   }, [cloudDeviceId, cloudReady, days, documents, storageReady, stops, surprises, todos]);
+
+  useEffect(() => {
+    const query = `${stepTitle} ${stepCity}`.trim();
+
+    if (planPanel !== 'new' || query.length < 3) {
+      setStepPlaceSuggestions([]);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      fetchPlaceSuggestions(query)
+        .then((suggestions) => {
+          if (!cancelled) {
+            setStepPlaceSuggestions(suggestions);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setStepPlaceSuggestions([]);
+          }
+        });
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [planPanel, stepCity, stepTitle]);
+
+  useEffect(() => {
+    const query = `${editTitle} ${editCity}`.trim();
+
+    if (!editingStopId || query.length < 3) {
+      setEditPlaceSuggestions([]);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      fetchPlaceSuggestions(query)
+        .then((suggestions) => {
+          if (!cancelled) {
+            setEditPlaceSuggestions(suggestions);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setEditPlaceSuggestions([]);
+          }
+        });
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [editCity, editTitle, editingStopId]);
 
   useEffect(() => {
     if (cloudDeviceId && pushDevices[cloudDeviceId]?.enabled) {
@@ -882,9 +953,45 @@ export default function App() {
     }
   }
 
+  function updateStepTitle(value: string) {
+    setStepTitle(value);
+    setStepSelectedPlace(undefined);
+  }
+
+  function updateStepCity(value: string) {
+    setStepCity(value);
+    setStepSelectedPlace(undefined);
+  }
+
+  function selectStepPlaceSuggestion(suggestion: PlaceSuggestion) {
+    setStepSelectedPlace(suggestion);
+    setStepCity(formatSuggestionArea(suggestion));
+    setStepPlaceSuggestions([]);
+
+    if (!stepTitle.trim()) {
+      setStepTitle(suggestion.name);
+    }
+  }
+
+  function updateEditTitle(value: string) {
+    setEditTitle(value);
+    setEditSelectedPlace(undefined);
+  }
+
+  function updateEditCity(value: string) {
+    setEditCity(value);
+    setEditSelectedPlace(undefined);
+  }
+
+  function selectEditPlaceSuggestion(suggestion: PlaceSuggestion) {
+    setEditSelectedPlace(suggestion);
+    setEditCity(formatSuggestionArea(suggestion));
+    setEditPlaceSuggestions([]);
+  }
+
   async function addStep() {
     const title = stepTitle.trim();
-    const city = stepCity.trim() || title;
+    const city = stepSelectedPlace ? formatSuggestionArea(stepSelectedPlace) : stepCity.trim() || title;
     const notes = stepNotes.trim() || 'New trip step. Add details later.';
     const date = stepDate.trim();
 
@@ -913,7 +1020,7 @@ export default function App() {
       latitude: region.latitude,
       longitude: region.longitude,
     };
-    const coordinates = await resolveTypedPlaceCoordinates(`${title} ${city}`, fallback);
+    const coordinates = stepSelectedPlace?.coordinates ?? await resolveTypedPlaceCoordinates(`${title} ${city}`, fallback);
     const recommendations = stepGuideEnabled ? await createGuideForPlace(title, city) : undefined;
     const stopId = `step-${Date.now()}`;
     const newStop: TripStop = {
@@ -926,8 +1033,13 @@ export default function App() {
       kind: 'stay',
       notes,
       travelModeFromPrevious: 'car',
+      address: stepSelectedPlace?.address,
+      links: stepSelectedPlace?.googleMapsUri
+        ? [{ label: 'Directions', url: stepSelectedPlace.googleMapsUri }]
+        : undefined,
       mapVisibility: 'marker',
       mapCategory: stepMapCategory,
+      placeId: stepSelectedPlace?.id,
       recommendations,
       coverColor: theme.accentDark,
     };
@@ -956,6 +1068,8 @@ export default function App() {
     setStepCity('');
     setStepNotes('');
     setStepMapCategory('general');
+    setStepPlaceSuggestions([]);
+    setStepSelectedPlace(undefined);
     setStepGuideStatus('');
     setStepError('');
   }
@@ -977,6 +1091,8 @@ export default function App() {
     setEditDate(stop.startsAt.slice(0, 10));
     setEditNotes(stop.notes);
     setEditMapCategory(stop.mapCategory ?? inferMapCategory(`${stop.title} ${stop.city}`));
+    setEditPlaceSuggestions([]);
+    setEditSelectedPlace(undefined);
   }
 
   function cancelStopEdit() {
@@ -985,11 +1101,13 @@ export default function App() {
     setEditCity('');
     setEditDate('');
     setEditNotes('');
+    setEditPlaceSuggestions([]);
+    setEditSelectedPlace(undefined);
   }
 
-  function saveStopEdit(stopId: string) {
+  async function saveStopEdit(stopId: string) {
     const title = editTitle.trim();
-    const city = editCity.trim();
+    const city = editSelectedPlace ? formatSuggestionArea(editSelectedPlace) : editCity.trim();
     const date = editDate.trim();
 
     if (!title || !city || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
@@ -998,6 +1116,11 @@ export default function App() {
     }
 
     const existingStop = stops.find((stop) => stop.id === stopId);
+    const fallback = existingStop?.coordinates ?? trip.stops[0]?.coordinates ?? {
+      latitude: region.latitude,
+      longitude: region.longitude,
+    };
+    const coordinates = editSelectedPlace?.coordinates ?? await resolveTypedPlaceCoordinates(`${title} ${city}`, fallback);
 
     setStops((current) =>
       current.map((stop) =>
@@ -1007,8 +1130,14 @@ export default function App() {
               title,
               city,
               startsAt: replaceIsoDate(stop.startsAt, date),
+              address: editSelectedPlace?.address ?? stop.address,
+              coordinates,
+              links: editSelectedPlace?.googleMapsUri
+                ? mergeStopLinks(stop.links, { label: 'Directions', url: editSelectedPlace.googleMapsUri })
+                : stop.links,
               notes: editNotes.trim() || 'New trip step. Add details later.',
               mapCategory: editMapCategory,
+              placeId: editSelectedPlace?.id ?? stop.placeId,
             }
           : stop,
       ),
@@ -1019,6 +1148,8 @@ export default function App() {
     }
 
     setEditingStopId(undefined);
+    setEditPlaceSuggestions([]);
+    setEditSelectedPlace(undefined);
   }
 
   function requestDeleteStop(stopId: string) {
@@ -1138,7 +1269,24 @@ export default function App() {
     Linking.openURL(document.uri);
   }
 
-  async function removeDocument(documentId: string) {
+  function removeDocument(documentId: string) {
+    const document = documents.find((item) => item.id === documentId);
+
+    if (!document) {
+      return;
+    }
+
+    Alert.alert('Remove PDF?', `Remove ${document.name}?`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Remove',
+        style: 'destructive',
+        onPress: () => deleteDocument(documentId),
+      },
+    ]);
+  }
+
+  async function deleteDocument(documentId: string) {
     const document = documents.find((item) => item.id === documentId);
     setDocuments((current) => current.filter((item) => item.id !== documentId));
 
@@ -1214,21 +1362,24 @@ export default function App() {
           guideStatus={stepGuideStatus}
           onOpenStop={openStopCard}
           onOpenSurprise={openSurpriseCard}
+          onSelectStepPlace={selectStepPlaceSuggestion}
           ownerMode={ownerMode}
           planPanel={planPanel}
           setCalendarMode={setCalendarMode}
           setGuideEnabled={setStepGuideEnabled}
           setPlanPanel={setPlanPanel}
           setStepMapCategory={setStepMapCategory}
-          setStepCity={setStepCity}
+          setStepCity={updateStepCity}
           setStepDate={setStepDate}
           setStepNotes={setStepNotes}
-          setStepTitle={setStepTitle}
+          setStepTitle={updateStepTitle}
           stepCity={stepCity}
           stepDate={stepDate}
           stepError={stepError}
           stepMapCategory={stepMapCategory}
           stepNotes={stepNotes}
+          stepPlaceSuggestions={stepPlaceSuggestions}
+          stepSelectedPlace={stepSelectedPlace}
           stepTitle={stepTitle}
           theme={theme}
           trip={trip}
@@ -1308,6 +1459,8 @@ export default function App() {
         editDate={editDate}
         editMapCategory={editMapCategory}
         editNotes={editNotes}
+        editPlaceSuggestions={editPlaceSuggestions}
+        editSelectedPlace={editSelectedPlace}
         editTitle={editTitle}
         isEditing={selectedStop?.id === editingStopId}
         onCancelEdit={cancelStopEdit}
@@ -1316,12 +1469,13 @@ export default function App() {
         openDocument={openDocument}
         removeDocument={removeDocument}
         onSaveEdit={saveStopEdit}
+        onSelectEditPlace={selectEditPlaceSuggestion}
         onStartEdit={beginStopEdit}
-        setEditCity={setEditCity}
+        setEditCity={updateEditCity}
         setEditDate={setEditDate}
         setEditMapCategory={setEditMapCategory}
         setEditNotes={setEditNotes}
-        setEditTitle={setEditTitle}
+        setEditTitle={updateEditTitle}
         stop={selectedStop}
         theme={theme}
         visible={placeCardVisible}
@@ -1420,8 +1574,10 @@ function MapScreen({
   upcomingStop?: TripStop;
   visibleSurprises: RevealedSurprise[];
 }) {
+  const [clusterStops, setClusterStops] = useState<TripStop[] | undefined>();
   const routeStops = useMemo(() => getStopsInDateOrder(trip.stops), [trip.stops]);
   const mapStops = useMemo(() => routeStops.filter(isMapPlaceStop), [routeStops]);
+  const mapStopGroups = useMemo(() => groupNearbyStops(mapStops), [mapStops]);
 
   return (
     <ScrollView contentContainerStyle={styles.screenContent} showsVerticalScrollIndicator={false}>
@@ -1442,24 +1598,45 @@ function MapScreen({
               />
             );
           })}
-          {mapStops.map((stop) => (
-            <Marker
-              coordinate={stop.coordinates}
-              key={stop.id}
-              onPress={() => onOpenStop(stop.id)}
-              description={getMarkerDescription(stop)}
-              title={getMarkerTitle(stop)}
-            >
-              <View
-                style={[
-                  styles.emojiMarker,
-                  { backgroundColor: stop.coverColor },
-                ]}
+          {mapStopGroups.map((group) => {
+            const stop = group.stops[0];
+
+            if (group.stops.length === 1) {
+              return (
+                <Marker
+                  coordinate={stop.coordinates}
+                  key={group.id}
+                  onPress={() => onOpenStop(stop.id)}
+                  description={getMarkerDescription(stop)}
+                  title={getMarkerTitle(stop)}
+                >
+                  <View
+                    style={[
+                      styles.emojiMarker,
+                      { backgroundColor: stop.coverColor },
+                    ]}
+                  >
+                    <Text style={styles.emojiMarkerText}>{getStopEmoji(stop)}</Text>
+                  </View>
+                </Marker>
+              );
+            }
+
+            return (
+              <Marker
+                coordinate={group.coordinates}
+                key={group.id}
+                onPress={() => setClusterStops(group.stops)}
+                title={`${group.stops.length} places`}
               >
-                <Text style={styles.emojiMarkerText}>{getStopEmoji(stop)}</Text>
-              </View>
-            </Marker>
-          ))}
+                <View style={[styles.clusterMarker, { backgroundColor: theme.text }]}>
+                  <Text style={[styles.clusterMarkerText, { color: theme.surface }]}>
+                    {group.stops.length}
+                  </Text>
+                </View>
+              </Marker>
+            );
+          })}
           {visibleSurprises
             .filter((surprise) => surprise.coordinates)
             .map((surprise) => (
@@ -1558,7 +1735,120 @@ function MapScreen({
         surprises={secondVisibleSurprises}
         theme={theme}
       />
+      <ClusterStopsModal
+        onClose={() => setClusterStops(undefined)}
+        onOpenStop={(stopId) => {
+          setClusterStops(undefined);
+          onOpenStop(stopId);
+        }}
+        stops={clusterStops ?? []}
+        theme={theme}
+        visible={Boolean(clusterStops)}
+      />
     </ScrollView>
+  );
+}
+
+function ClusterStopsModal({
+  onClose,
+  onOpenStop,
+  stops,
+  theme,
+  visible,
+}: {
+  onClose: () => void;
+  onOpenStop: (stopId: string) => void;
+  stops: TripStop[];
+  theme: (typeof themes)[ThemeKey];
+  visible: boolean;
+}) {
+  return (
+    <Modal animationType="fade" transparent visible={visible}>
+      <View style={styles.modalBackdrop}>
+        <View style={[styles.clusterPanel, { backgroundColor: theme.surface }]}>
+          <View style={styles.panelHeader}>
+            <View style={styles.flexOne}>
+              <Text style={[styles.eyebrow, { color: theme.muted }]}>Map cluster</Text>
+              <Text style={[styles.panelTitle, { color: theme.text }]}>{stops.length} places here</Text>
+            </View>
+            <Pressable
+              accessibilityRole="button"
+              onPress={onClose}
+              style={[styles.iconButton, { backgroundColor: theme.softSurface }]}
+            >
+              <X size={20} color={theme.text} />
+            </Pressable>
+          </View>
+          {stops.map((stop) => (
+            <Pressable
+              accessibilityRole="button"
+              key={stop.id}
+              onPress={() => onOpenStop(stop.id)}
+              style={[styles.clusterStopRow, { backgroundColor: theme.softSurface }]}
+            >
+              <Text style={styles.settingsTripEmoji}>{getStopEmoji(stop)}</Text>
+              <View style={styles.flexOne}>
+                <Text style={[styles.compactTitle, { color: theme.text }]}>{stop.title}</Text>
+                <Text style={[styles.compactMeta, { color: theme.muted }]}>{stop.city}</Text>
+              </View>
+              <ExternalLink size={15} color={theme.text} />
+            </Pressable>
+          ))}
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function PlaceSuggestionList({
+  onSelect,
+  selectedSuggestion,
+  suggestions,
+  theme,
+}: {
+  onSelect: (suggestion: PlaceSuggestion) => void;
+  selectedSuggestion?: PlaceSuggestion;
+  suggestions: PlaceSuggestion[];
+  theme: (typeof themes)[ThemeKey];
+}) {
+  if (selectedSuggestion) {
+    return (
+      <View style={[styles.placeSuggestionSelected, { backgroundColor: theme.softSurface }]}>
+        <Check size={16} color={theme.accentDark} />
+        <View style={styles.flexOne}>
+          <Text style={[styles.compactTitle, { color: theme.text }]}>{selectedSuggestion.name}</Text>
+          {selectedSuggestion.address && (
+            <Text style={[styles.compactMeta, { color: theme.muted }]}>{selectedSuggestion.address}</Text>
+          )}
+        </View>
+      </View>
+    );
+  }
+
+  if (suggestions.length === 0) {
+    return null;
+  }
+
+  return (
+    <View style={styles.placeSuggestionArea}>
+      <Text style={[styles.controlLabel, { color: theme.muted }]}>Choose exact place</Text>
+      {suggestions.map((suggestion) => (
+        <Pressable
+          accessibilityRole="button"
+          key={suggestion.id}
+          onPress={() => onSelect(suggestion)}
+          style={[styles.placeSuggestionRow, { backgroundColor: theme.softSurface, borderColor: theme.border }]}
+        >
+          <MapPin size={16} color={theme.accentDark} />
+          <View style={styles.flexOne}>
+            <Text style={[styles.compactTitle, { color: theme.text }]}>{suggestion.name}</Text>
+            {suggestion.address && (
+              <Text style={[styles.compactMeta, { color: theme.muted }]}>{suggestion.address}</Text>
+            )}
+          </View>
+        </Pressable>
+      ))}
+    </View>
   );
 }
 
@@ -1569,12 +1859,15 @@ function SelectedStopCard({
   editDate,
   editMapCategory,
   editNotes,
+  editPlaceSuggestions,
+  editSelectedPlace,
   editTitle,
   isEditing,
   onCancelEdit,
   openDocument,
   removeDocument,
   onSaveEdit,
+  onSelectEditPlace,
   setEditCity,
   setEditDate,
   setEditMapCategory,
@@ -1589,12 +1882,15 @@ function SelectedStopCard({
   editDate: string;
   editMapCategory: MapCategory;
   editNotes: string;
+  editPlaceSuggestions: PlaceSuggestion[];
+  editSelectedPlace?: PlaceSuggestion;
   editTitle: string;
   isEditing: boolean;
   onCancelEdit: () => void;
   openDocument: (document: TripDocument) => void;
   removeDocument: (documentId: string) => void;
   onSaveEdit: (stopId: string) => void;
+  onSelectEditPlace: (suggestion: PlaceSuggestion) => void;
   setEditCity: (value: string) => void;
   setEditDate: (value: string) => void;
   setEditMapCategory: (value: MapCategory) => void;
@@ -1655,6 +1951,12 @@ function SelectedStopCard({
               value={editDate}
             />
           </View>
+          <PlaceSuggestionList
+            onSelect={onSelectEditPlace}
+            selectedSuggestion={editSelectedPlace}
+            suggestions={editPlaceSuggestions}
+            theme={theme}
+          />
           <Text style={[styles.controlLabel, { color: theme.muted }]}>Category</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.categoryEditRail}>
             {editableMapCategories.map((item) => (
@@ -1843,6 +2145,8 @@ function PlaceCardModal({
   editDate,
   editMapCategory,
   editNotes,
+  editPlaceSuggestions,
+  editSelectedPlace,
   editTitle,
   isEditing,
   onCancelEdit,
@@ -1851,6 +2155,7 @@ function PlaceCardModal({
   openDocument,
   removeDocument,
   onSaveEdit,
+  onSelectEditPlace,
   onStartEdit,
   setEditCity,
   setEditDate,
@@ -1867,6 +2172,8 @@ function PlaceCardModal({
   editDate: string;
   editMapCategory: MapCategory;
   editNotes: string;
+  editPlaceSuggestions: PlaceSuggestion[];
+  editSelectedPlace?: PlaceSuggestion;
   editTitle: string;
   isEditing: boolean;
   onCancelEdit: () => void;
@@ -1875,6 +2182,7 @@ function PlaceCardModal({
   openDocument: (document: TripDocument) => void;
   removeDocument: (documentId: string) => void;
   onSaveEdit: (stopId: string) => void;
+  onSelectEditPlace: (suggestion: PlaceSuggestion) => void;
   onStartEdit: (stop: TripStop) => void;
   setEditCity: (value: string) => void;
   setEditDate: (value: string) => void;
@@ -1957,12 +2265,15 @@ function PlaceCardModal({
               editDate={editDate}
               editMapCategory={editMapCategory}
               editNotes={editNotes}
+              editPlaceSuggestions={editPlaceSuggestions}
+              editSelectedPlace={editSelectedPlace}
               editTitle={editTitle}
               isEditing={isEditing}
               onCancelEdit={onCancelEdit}
               openDocument={openDocument}
               removeDocument={removeDocument}
               onSaveEdit={onSaveEdit}
+              onSelectEditPlace={onSelectEditPlace}
               setEditCity={setEditCity}
               setEditDate={setEditDate}
               setEditMapCategory={setEditMapCategory}
@@ -2510,6 +2821,7 @@ function TimelineScreen({
   guideStatus,
   onOpenStop,
   onOpenSurprise,
+  onSelectStepPlace,
   ownerMode,
   planPanel,
   setCalendarMode,
@@ -2525,6 +2837,8 @@ function TimelineScreen({
   stepError,
   stepMapCategory,
   stepNotes,
+  stepPlaceSuggestions,
+  stepSelectedPlace,
   stepTitle,
   theme,
   trip,
@@ -2537,6 +2851,7 @@ function TimelineScreen({
   guideStatus: string;
   onOpenStop: (stopId: string) => void;
   onOpenSurprise: (surpriseId: string) => void;
+  onSelectStepPlace: (suggestion: PlaceSuggestion) => void;
   ownerMode: boolean;
   planPanel: PlanPanel;
   setCalendarMode: (mode: CalendarMode) => void;
@@ -2552,13 +2867,16 @@ function TimelineScreen({
   stepError: string;
   stepMapCategory: MapCategory;
   stepNotes: string;
+  stepPlaceSuggestions: PlaceSuggestion[];
+  stepSelectedPlace?: PlaceSuggestion;
   stepTitle: string;
   theme: (typeof themes)[ThemeKey];
   trip: Trip;
   visibleSurprises: RevealedSurprise[];
   windowStartDate: string;
 }) {
-  const addDisabled = guideStatus.length > 0;
+  const mustChooseStepPlace = stepPlaceSuggestions.length > 0 && !stepSelectedPlace;
+  const addDisabled = guideStatus.length > 0 || mustChooseStepPlace;
 
   return (
     <ScrollView contentContainerStyle={styles.screenContent} showsVerticalScrollIndicator={false}>
@@ -2639,6 +2957,17 @@ function TimelineScreen({
                 value={stepDate}
               />
             </View>
+            <PlaceSuggestionList
+              onSelect={onSelectStepPlace}
+              selectedSuggestion={stepSelectedPlace}
+              suggestions={stepPlaceSuggestions}
+              theme={theme}
+            />
+            {mustChooseStepPlace && (
+              <Text style={[styles.compactMeta, { color: theme.accentDark }]}>
+                Choose one suggested place so the map pin is exact.
+              </Text>
+            )}
             <Text style={[styles.controlLabel, { color: theme.muted }]}>Icon</Text>
             <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.categoryEditRail}>
               {editableMapCategories.map((item) => (
@@ -3295,6 +3624,42 @@ function getStopsInDateOrder(stops: TripStop[]) {
   return stops.slice().sort((left, right) => Date.parse(left.startsAt) - Date.parse(right.startsAt));
 }
 
+function groupNearbyStops(stops: TripStop[], thresholdMeters = 40) {
+  const groups: Array<{
+    coordinates: Coordinates;
+    id: string;
+    stops: TripStop[];
+  }> = [];
+
+  for (const stop of stops) {
+    const existingGroup = groups.find(
+      (group) => distanceMeters(group.coordinates, stop.coordinates) <= thresholdMeters,
+    );
+
+    if (existingGroup) {
+      existingGroup.stops.push(stop);
+      existingGroup.coordinates = averageCoordinates(existingGroup.stops.map((item) => item.coordinates));
+    } else {
+      groups.push({
+        coordinates: stop.coordinates,
+        id: `cluster-${stop.id}`,
+        stops: [stop],
+      });
+    }
+  }
+
+  return groups;
+}
+
+function averageCoordinates(coordinates: Coordinates[]): Coordinates {
+  return {
+    latitude:
+      coordinates.reduce((total, coordinate) => total + coordinate.latitude, 0) / coordinates.length,
+    longitude:
+      coordinates.reduce((total, coordinate) => total + coordinate.longitude, 0) / coordinates.length,
+  };
+}
+
 function isMapPlaceStop(stop: TripStop) {
   if (stop.mapVisibility === 'route-only') {
     return false;
@@ -3408,6 +3773,49 @@ function inferCountry(value: string) {
   }
 
   return 'Indonesia';
+}
+
+async function fetchPlaceSuggestions(query: string): Promise<PlaceSuggestion[]> {
+  const endpoint = getPlaceSuggestionsEndpoint();
+
+  if (!endpoint) {
+    return [];
+  }
+
+  const response = await fetch(endpoint, {
+    body: JSON.stringify({ query }),
+    headers: { 'Content-Type': 'application/json' },
+    method: 'POST',
+  });
+
+  if (!response.ok) {
+    return [];
+  }
+
+  const payload = await response.json();
+  return Array.isArray(payload.suggestions) ? payload.suggestions : [];
+}
+
+function getPlaceSuggestionsEndpoint() {
+  const researchEndpoint = process.env.EXPO_PUBLIC_SOCIAL_RESEARCH_ENDPOINT;
+
+  if (!researchEndpoint) {
+    return undefined;
+  }
+
+  return researchEndpoint.replace(/\/research\/place\/?$/, '/research/place-suggestions');
+}
+
+function formatSuggestionArea(suggestion: PlaceSuggestion) {
+  return suggestion.address ?? suggestion.name;
+}
+
+function mergeStopLinks(
+  links: TripStop['links'],
+  nextLink: NonNullable<TripStop['links']>[number],
+): TripStop['links'] {
+  const withoutDuplicate = (links ?? []).filter((link) => link.label !== nextLink.label);
+  return [...withoutDuplicate, nextLink];
 }
 
 async function resolveTypedPlaceCoordinates(
@@ -3799,6 +4207,37 @@ const styles = StyleSheet.create({
   },
   calendarSurpriseStop: {
     backgroundColor: '#FFF3B0',
+  },
+  clusterMarker: {
+    alignItems: 'center',
+    borderColor: '#FFFFFF',
+    borderRadius: 19,
+    borderWidth: 2,
+    height: 38,
+    justifyContent: 'center',
+    shadowColor: '#000000',
+    shadowOpacity: 0.22,
+    shadowRadius: 5,
+    width: 38,
+  },
+  clusterMarkerText: {
+    fontSize: 15,
+    fontWeight: '900',
+  },
+  clusterPanel: {
+    borderRadius: 8,
+    maxHeight: '76%',
+    padding: 16,
+    width: '88%',
+  },
+  clusterStopRow: {
+    alignItems: 'center',
+    borderRadius: 8,
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 8,
+    minHeight: 54,
+    paddingHorizontal: 12,
   },
   cardActionItem: {
     alignItems: 'center',
@@ -4245,6 +4684,28 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     marginTop: 8,
     padding: 12,
+  },
+  placeSuggestionArea: {
+    marginTop: 2,
+  },
+  placeSuggestionRow: {
+    alignItems: 'flex-start',
+    borderRadius: 8,
+    borderWidth: 1,
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 8,
+    minHeight: 50,
+    padding: 10,
+  },
+  placeSuggestionSelected: {
+    alignItems: 'flex-start',
+    borderRadius: 8,
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 10,
+    minHeight: 46,
+    padding: 10,
   },
   placeModalPanel: {
     borderRadius: 8,

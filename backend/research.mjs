@@ -82,6 +82,93 @@ export async function researchPlace({
   };
 }
 
+export async function suggestPlaces({
+  env = process.env,
+  fetcher = fetch,
+  maxResults = 5,
+  query,
+}) {
+  const cleanQuery = String(query ?? '').trim();
+
+  if (!cleanQuery) {
+    return {
+      suggestions: [],
+      meta: {
+        errors: ['Missing query'],
+        provider: { configured: false, id: 'google-places', label: 'Google Places API' },
+      },
+    };
+  }
+
+  const apiKey = env.GOOGLE_PLACES_API_KEY;
+  if (!apiKey) {
+    return {
+      suggestions: [],
+      meta: {
+        errors: ['Set GOOGLE_PLACES_API_KEY to enable place suggestions.'],
+        provider: { configured: false, id: 'google-places', label: 'Google Places API' },
+      },
+    };
+  }
+
+  try {
+    const response = await fetcher('https://places.googleapis.com/v1/places:searchText', {
+      body: JSON.stringify({
+        maxResultCount: maxResults,
+        textQuery: cleanQuery,
+      }),
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': apiKey,
+        'X-Goog-FieldMask':
+          'places.id,places.displayName,places.formattedAddress,places.googleMapsUri,places.location',
+      },
+      method: 'POST',
+    });
+
+    if (!response.ok) {
+      return {
+        suggestions: [],
+        meta: {
+          errors: [`Google Places returned ${response.status}.`],
+          provider: { configured: true, id: 'google-places', label: 'Google Places API' },
+        },
+      };
+    }
+
+    const payload = await response.json();
+    const suggestions = (payload.places ?? [])
+      .filter((place) => place.displayName?.text && place.location)
+      .map((place) => ({
+        address: place.formattedAddress,
+        coordinates: {
+          latitude: place.location.latitude,
+          longitude: place.location.longitude,
+        },
+        googleMapsUri: place.googleMapsUri,
+        id: place.id,
+        name: place.displayName.text,
+      }));
+
+    return {
+      suggestions,
+      meta: {
+        fetchedAt: new Date().toISOString(),
+        provider: { configured: true, id: 'google-places', label: 'Google Places API' },
+        query: cleanQuery,
+      },
+    };
+  } catch {
+    return {
+      suggestions: [],
+      meta: {
+        errors: ['Could not fetch Google Places suggestions.'],
+        provider: { configured: true, id: 'google-places', label: 'Google Places API' },
+      },
+    };
+  }
+}
+
 function youtubeProvider({ env, fetcher, maxResultsPerProvider }) {
   return {
     async search({ place, topics }) {
@@ -299,4 +386,3 @@ function slugify(value) {
 function trimTitle(value) {
   return value.length > 80 ? `${value.slice(0, 77)}...` : value;
 }
-

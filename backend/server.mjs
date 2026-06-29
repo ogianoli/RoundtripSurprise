@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
-import { researchPlace } from './research.mjs';
+import { researchPlace, suggestPlaces } from './research.mjs';
 
 loadEnvFile(new URL('./.env', import.meta.url));
 
@@ -27,6 +27,23 @@ const server = createServer(async (request, response) => {
         maxResultsPerProvider: Number(process.env.MAX_RESULTS_PER_PROVIDER ?? 2),
         place: body.place,
         topics: body.topics,
+      });
+
+      sendJson(response, 200, result);
+    } catch (error) {
+      sendJson(response, 500, {
+        error: error instanceof Error ? error.message : 'Unknown backend error',
+      });
+    }
+    return;
+  }
+
+  if (request.method === 'POST' && request.url === '/research/place-suggestions') {
+    try {
+      const body = await readJson(request);
+      const result = await suggestPlaces({
+        maxResults: Number(process.env.MAX_PLACE_SUGGESTIONS ?? 5),
+        query: body.query,
       });
 
       sendJson(response, 200, result);

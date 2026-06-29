@@ -58,6 +58,12 @@ The app endpoint will be:
 https://roundtrip-research-backend.onrender.com/research/place
 ```
 
+The same backend also serves place suggestions for exact map pins:
+
+```text
+https://roundtrip-research-backend.onrender.com/research/place-suggestions
+```
+
 ## 3. EAS Environment Variable
 
 After the backend is live, add the public backend endpoint to EAS:
