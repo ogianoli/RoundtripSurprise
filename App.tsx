@@ -15,6 +15,7 @@ import {
   View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
+import Constants from 'expo-constants';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Location from 'expo-location';
@@ -44,10 +45,22 @@ import {
 
 import { sampleTrip } from './src/data/sampleTrip';
 import {
+  CloudUserProfile,
   CloudTripData,
+  TripSummary,
+  createCloudTripDataFromTrip,
+  createCloudAccount,
+  createTripOnCloud,
+  findUserProfile,
   isFirebaseSyncConfigured,
+  listenTripsForMember,
+  normalizeMemberNames,
+  normalizeUsername,
   savePushDeviceToCloud,
   saveTripToCloud,
+  saveTripSummaryToCloud,
+  signInCloudAccount,
+  signOutCloudAccount,
   startTripCloudSync,
 } from './src/lib/firebaseSync';
 import {
@@ -105,6 +118,11 @@ type TabKey = 'map' | 'timeline' | 'todo' | 'studio';
 type ThemeKey = 'light' | 'dark' | 'lilac' | 'green' | 'blue';
 type CalendarMode = 'week' | 'month';
 type PlanPanel = 'calendar' | 'new';
+type AuthMode = 'login' | 'create';
+
+type UserProfile = CloudUserProfile;
+
+type TripInfo = Pick<Trip, 'id' | 'title' | 'travelers' | 'startsAt' | 'endsAt' | 'homeTimezone'>;
 
 type PlaceSuggestion = {
   address?: string;
@@ -115,15 +133,19 @@ type PlaceSuggestion = {
 };
 
 const THEME_KEY = 'roundtrip.theme.v1';
+const PROFILE_KEY = 'roundtrip.profile.v1';
+const TRIP_LIST_LAST_PROFILE_KEY = 'roundtrip.tripProfile.v1';
 const DATA_VERSION_KEY = 'roundtrip.dataVersion.v1';
-const DATA_VERSION = '2026-08-trip-v7';
+const DATA_VERSION = '2026-08-trip-v8';
 const LOCAL_DATA_DIRECTORY = `${FileSystem.documentDirectory ?? ''}roundtrip-data/`;
+const TRIP_DATA_FILE = 'trip.json';
 const SURPRISES_FILE = 'surprises.json';
 const STOPS_FILE = 'stops.json';
 const DAYS_FILE = 'days.json';
 const TODOS_FILE = 'todos.json';
 const DOCUMENTS_FILE = 'documents.json';
 const CLOUD_DEVICE_ID_KEY = 'roundtrip.cloudDeviceId.v1';
+const APP_VERSION = Constants.expoConfig?.version ?? 'dev';
 
 const region = {
   latitude: 20.5,
@@ -258,6 +280,22 @@ async function writeLocalJson(fileName: string, value: unknown) {
   await FileSystem.writeAsStringAsync(`${LOCAL_DATA_DIRECTORY}${fileName}`, JSON.stringify(value));
 }
 
+async function readLocalTripData(tripId: string): Promise<CloudTripData | undefined> {
+  return readLocalJson<CloudTripData>(getTripDataFileName(tripId));
+}
+
+async function writeLocalTripData(tripId: string, value: CloudTripData) {
+  await writeLocalJson(getTripDataFileName(tripId), value);
+}
+
+function getTripDataFileName(tripId: string) {
+  return `${sanitizeStorageKey(tripId)}-${TRIP_DATA_FILE}`;
+}
+
+function sanitizeStorageKey(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/(^-|-$)/g, '') || 'trip';
+}
+
 async function getOrCreateCloudDeviceId() {
   const storedId = await SecureStore.getItemAsync(CLOUD_DEVICE_ID_KEY);
 
@@ -275,9 +313,14 @@ function createCloudTripData(trip: CloudTripData): CloudTripData {
     dataVersion: trip.dataVersion,
     days: trip.days,
     documents: trip.documents,
+    endsAt: trip.endsAt,
+    homeTimezone: trip.homeTimezone,
+    startsAt: trip.startsAt,
     stops: trip.stops,
     surprises: trip.surprises,
+    title: trip.title,
     todos: trip.todos,
+    travelers: trip.travelers,
   };
 }
 
@@ -331,7 +374,141 @@ function uniqueValues(values: string[]) {
   return values.filter((value, index) => values.indexOf(value) === index);
 }
 
+function createTripInfo(trip: Trip): TripInfo {
+  return {
+    endsAt: trip.endsAt,
+    homeTimezone: trip.homeTimezone,
+    id: trip.id,
+    startsAt: trip.startsAt,
+    title: trip.title,
+    travelers: trip.travelers,
+  };
+}
+
+function createTripInfoFromCloud(tripId: string, trip: CloudTripData): TripInfo {
+  return {
+    endsAt: trip.endsAt,
+    homeTimezone: trip.homeTimezone,
+    id: tripId,
+    startsAt: trip.startsAt,
+    title: trip.title,
+    travelers: trip.travelers,
+  };
+}
+
+function createDefaultTripSummary(profile: UserProfile): TripSummary {
+  return {
+    createdByProfileId: profile.id,
+    id: sampleTrip.id,
+    isPrivate: false,
+    memberIds: [profile.id],
+    memberNames: [profile.username],
+    ownerName: profile.username,
+    startsAt: sampleTrip.startsAt,
+    title: sampleTrip.title,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function createBlankTrip(title: string, profile: UserProfile): Trip {
+  const date = new Date().toISOString().slice(0, 10);
+  return {
+    id: `trip-${Date.now()}-${slugify(title).slice(0, 24) || 'new'}`,
+    title,
+    travelers: [profile.username],
+    startsAt: `${date}T10:00:00+01:00`,
+    endsAt: `${date}T22:00:00+01:00`,
+    homeTimezone: 'Europe/Zurich',
+    stops: [],
+    days: [
+      {
+        id: `day-${date}`,
+        date,
+        title,
+        summary: 'Start planning this trip.',
+        stops: [],
+      },
+    ],
+    todos: [],
+    documents: [],
+    surprises: [],
+  };
+}
+
+function createEmptyTripDay(title: string) {
+  const date = new Date().toISOString().slice(0, 10);
+
+  return {
+    id: `day-${date}`,
+    date,
+    title,
+    summary: 'Start planning this trip.',
+    stops: [],
+  };
+}
+
+function mergeTripSummaries(localTrips: TripSummary[], remoteTrips: TripSummary[]) {
+  const byId = new Map<string, TripSummary>();
+
+  [...localTrips, ...remoteTrips].forEach((trip) => {
+    byId.set(trip.id, {
+      ...byId.get(trip.id),
+      ...trip,
+      memberIds: uniqueValues(trip.memberIds ?? []),
+      memberNames: normalizeMemberNames(trip.memberNames),
+    });
+  });
+
+  return Array.from(byId.values()).sort((left, right) =>
+    (right.updatedAt ?? right.startsAt ?? '').localeCompare(left.updatedAt ?? left.startsAt ?? ''),
+  );
+}
+
+function isTripAccessible(summary: TripSummary, profile: UserProfile) {
+  return Boolean(summary.memberIds?.includes(profile.id)) || summary.memberNames.includes(profile.normalizedName);
+}
+
+function getTripDateRangeLabel(trip: Pick<Trip, 'startsAt' | 'endsAt'>) {
+  return `${formatShortDateTime(trip.startsAt)}-${formatShortDateTime(trip.endsAt)}`;
+}
+
+function normalizeStoredProfile(value: Partial<UserProfile> & { password?: string }): UserProfile {
+  const username = normalizeUsername(value.username ?? value.normalizedName ?? value.name ?? 'traveler');
+
+  return {
+    email: (value.email ?? '').trim().toLowerCase(),
+    id: value.id ?? '',
+    name: username,
+    normalizedName: username,
+    photoUri: value.photoUri,
+    username,
+  };
+}
+
 export default function App() {
+  const [authReady, setAuthReady] = useState(false);
+  const [authMode, setAuthMode] = useState<AuthMode>('login');
+  const [profile, setProfile] = useState<UserProfile | undefined>();
+  const [loggedIn, setLoggedIn] = useState(false);
+  const [profileName, setProfileName] = useState('');
+  const [profileEmail, setProfileEmail] = useState('');
+  const [profilePassword, setProfilePassword] = useState('');
+  const [profilePhotoUri, setProfilePhotoUri] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [tripSummaries, setTripSummaries] = useState<TripSummary[]>([]);
+  const [tripListStatus, setTripListStatus] = useState(
+    isFirebaseSyncConfigured() ? 'Loading trips...' : 'Trip sync off',
+  );
+  const [selectedTripSummary, setSelectedTripSummary] = useState<TripSummary | undefined>();
+  const [selectedTripId, setSelectedTripId] = useState('');
+  const [tripPasswordGate, setTripPasswordGate] = useState<TripSummary | undefined>();
+  const [tripPasswordEntry, setTripPasswordEntry] = useState('');
+  const [tripPasswordError, setTripPasswordError] = useState('');
+  const [newTripName, setNewTripName] = useState('');
+  const [newTripPassword, setNewTripPassword] = useState('');
+  const [newTripError, setNewTripError] = useState('');
+  const [inviteName, setInviteName] = useState('');
+  const [inviteStatus, setInviteStatus] = useState('');
   const [activeTab, setActiveTab] = useState<TabKey>('map');
   const [now, setNow] = useState(() => new Date());
   const [ownerMode, setOwnerMode] = useState(false);
@@ -344,6 +521,7 @@ export default function App() {
   const [placeCardVisible, setPlaceCardVisible] = useState(false);
   const [calendarMode, setCalendarMode] = useState<CalendarMode>('week');
   const [planPanel, setPlanPanel] = useState<PlanPanel>('calendar');
+  const [tripInfo, setTripInfo] = useState<TripInfo>(() => createTripInfo(sampleTrip));
   const [stops, setStops] = useState<TripStop[]>(sampleTrip.stops);
   const [days, setDays] = useState<TripDay[]>(sampleTrip.days);
   const [todos, setTodos] = useState<TripTodo[]>(sampleTrip.todos);
@@ -391,17 +569,21 @@ export default function App() {
   const lastCloudSignature = useRef('');
 
   const theme = themes[themeKey];
+  const availableTrips = useMemo(
+    () => (profile ? mergeTripSummaries([createDefaultTripSummary(profile)], tripSummaries) : tripSummaries),
+    [profile, tripSummaries],
+  );
 
   const trip: Trip = useMemo(
     () => ({
-      ...sampleTrip,
+      ...tripInfo,
       stops,
       days,
       todos,
       documents,
       surprises,
     }),
-    [days, documents, stops, surprises, todos],
+    [days, documents, stops, surprises, todos, tripInfo],
   );
 
   const selectedStop = useMemo(
@@ -417,26 +599,12 @@ export default function App() {
   useEffect(() => {
     let mounted = true;
 
-    async function loadStorage() {
+    async function loadProfileStorage() {
       try {
-        const [
-          storedTheme,
-          storedDataVersion,
-          storedSurprises,
-          storedStops,
-          storedDays,
-          storedTodos,
-          storedDocuments,
-        ] =
-          await Promise.all([
-            SecureStore.getItemAsync(THEME_KEY),
-            SecureStore.getItemAsync(DATA_VERSION_KEY),
-            readLocalJson<SurpriseStop[]>(SURPRISES_FILE),
-            readLocalJson<TripStop[]>(STOPS_FILE),
-            readLocalJson<TripDay[]>(DAYS_FILE),
-            readLocalJson<TripTodo[]>(TODOS_FILE),
-            readLocalJson<TripDocument[]>(DOCUMENTS_FILE),
-          ]);
+        const [storedTheme, storedProfile] = await Promise.all([
+          SecureStore.getItemAsync(THEME_KEY),
+          SecureStore.getItemAsync(PROFILE_KEY),
+        ]);
 
         if (!mounted) {
           return;
@@ -446,45 +614,90 @@ export default function App() {
           setThemeKey(storedTheme as ThemeKey);
         }
 
-        const shouldLoadStoredTrip = storedDataVersion === DATA_VERSION;
-
-        if (Array.isArray(storedStops) && storedStops.length > 0) {
-          setStops(
-            shouldLoadStoredTrip
-              ? storedStops
-              : mergeStopsWithDefaults(sampleTrip.stops, storedStops),
-          );
-        }
-
-        if (Array.isArray(storedDays) && storedDays.length > 0) {
-          setDays(
-            shouldLoadStoredTrip
-              ? storedDays
-              : mergeDaysWithDefaults(sampleTrip.days, storedDays),
-          );
-        }
-
-        if (Array.isArray(storedTodos)) {
-          setTodos(
-            shouldLoadStoredTrip
-              ? storedTodos
-              : mergeRecordsWithDefaults(sampleTrip.todos, storedTodos),
-          );
-        }
-
-        if (Array.isArray(storedDocuments)) {
-          setDocuments(storedDocuments);
-        }
-
-        if (Array.isArray(storedSurprises)) {
-          setSurprises(
-            shouldLoadStoredTrip
-              ? storedSurprises
-              : mergeRecordsWithDefaults(sampleTrip.surprises, storedSurprises),
-          );
+        if (storedProfile) {
+          const parsedProfile = normalizeStoredProfile(JSON.parse(storedProfile) as Partial<UserProfile>);
+          setProfile(parsedProfile);
+          setProfileName(parsedProfile.username || parsedProfile.email);
+          setProfileEmail(parsedProfile.email);
+          setProfilePhotoUri(parsedProfile.photoUri ?? '');
+          setAuthMode('login');
+        } else {
+          setAuthMode('create');
         }
       } catch {
-        setLocationStatus('Local storage unavailable');
+        setAuthError('Local profile storage unavailable.');
+      } finally {
+        if (mounted) {
+          setAuthReady(true);
+        }
+      }
+    }
+
+    loadProfileStorage();
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedTripId) {
+      setStorageReady(false);
+      return;
+    }
+
+    let mounted = true;
+    setStorageReady(false);
+    setCloudReady(false);
+    setCloudSyncStatus(isFirebaseSyncConfigured() ? 'Cloud sync starting' : 'Cloud sync off');
+    lastCloudSignature.current = '';
+
+    async function loadTripStorage() {
+      try {
+        const storedTrip = await readLocalTripData(selectedTripId);
+
+        if (!mounted) {
+          return;
+        }
+
+        if (storedTrip?.dataVersion === DATA_VERSION) {
+          setTripInfo(createTripInfoFromCloud(selectedTripId, storedTrip));
+          setStops(storedTrip.stops);
+          setDays(storedTrip.days);
+          setTodos(storedTrip.todos);
+          setDocuments(storedTrip.documents);
+          setSurprises(storedTrip.surprises);
+          setSelectedStopId(storedTrip.stops.find(isMapPlaceStop)?.id ?? storedTrip.stops[0]?.id ?? '');
+          return;
+        }
+
+        if (selectedTripId === sampleTrip.id) {
+          setTripInfo(createTripInfo(sampleTrip));
+          setStops(sampleTrip.stops);
+          setDays(sampleTrip.days);
+          setTodos(sampleTrip.todos);
+          setDocuments(sampleTrip.documents);
+          setSurprises(sampleTrip.surprises);
+          setSelectedStopId('mondrian-singapore');
+          return;
+        }
+
+        setTripInfo({
+          endsAt: new Date().toISOString(),
+          homeTimezone: 'Europe/Zurich',
+          id: selectedTripId,
+          startsAt: new Date().toISOString(),
+          title: selectedTripSummary?.title ?? 'New trip',
+          travelers: profile ? [profile.username] : [],
+        });
+        setStops([]);
+        setDays([createEmptyTripDay(selectedTripSummary?.title ?? 'New trip')]);
+        setTodos([]);
+        setDocuments([]);
+        setSurprises([]);
+        setSelectedStopId('');
+      } catch {
+        setLocationStatus('Local trip storage unavailable');
       } finally {
         if (mounted) {
           setStorageReady(true);
@@ -492,12 +705,12 @@ export default function App() {
       }
     }
 
-    loadStorage();
+    loadTripStorage();
 
     return () => {
       mounted = false;
     };
-  }, []);
+  }, [profile, selectedTripId, selectedTripSummary]);
 
   useEffect(() => {
     if (!placeCardVisible) {
@@ -512,25 +725,73 @@ export default function App() {
   }, [surpriseCardVisible]);
 
   useEffect(() => {
-    if (!storageReady) {
+    if (!storageReady || !selectedTripId) {
       return;
     }
 
     Promise.all([
-      writeLocalJson(SURPRISES_FILE, surprises),
-      writeLocalJson(STOPS_FILE, stops),
-      writeLocalJson(DAYS_FILE, days),
-      writeLocalJson(TODOS_FILE, todos),
-      writeLocalJson(DOCUMENTS_FILE, documents),
+      writeLocalTripData(selectedTripId, createCloudTripDataFromTrip(trip, DATA_VERSION)),
       SecureStore.setItemAsync(THEME_KEY, themeKey),
       SecureStore.setItemAsync(DATA_VERSION_KEY, DATA_VERSION),
     ]).catch(() => {
       setLocationStatus('Could not save local app data');
     });
-  }, [days, documents, storageReady, stops, surprises, themeKey, todos]);
+  }, [selectedTripId, storageReady, themeKey, trip]);
 
   useEffect(() => {
-    if (!storageReady) {
+    if (!loggedIn || !profile) {
+      setTripSummaries([]);
+      return;
+    }
+
+    const localDefaultTrip = createDefaultTripSummary(profile);
+
+    if (!isFirebaseSyncConfigured()) {
+      setTripSummaries([localDefaultTrip]);
+      setTripListStatus('Trip sync off');
+      return;
+    }
+
+    let mounted = true;
+    let unsubscribe: (() => void) | undefined;
+    const profileMemberId = profile.id;
+    const profileMemberName = profile.normalizedName;
+
+    async function connectTripList() {
+      try {
+        unsubscribe = await listenTripsForMember({
+          memberId: profileMemberId,
+          memberName: profileMemberName,
+          onStatus: (status) => {
+            if (mounted) {
+              setTripListStatus(status);
+            }
+          },
+          onTrips: (remoteTrips) => {
+            if (mounted) {
+              setTripSummaries(mergeTripSummaries([localDefaultTrip], remoteTrips));
+            }
+          },
+        });
+      } catch {
+        if (mounted) {
+          setTripSummaries([localDefaultTrip]);
+          setTripListStatus('Trip list unavailable');
+        }
+      }
+    }
+
+    setTripSummaries([localDefaultTrip]);
+    connectTripList();
+
+    return () => {
+      mounted = false;
+      unsubscribe?.();
+    };
+  }, [loggedIn, profile]);
+
+  useEffect(() => {
+    if (!storageReady || !selectedTripId) {
       return;
     }
 
@@ -569,11 +830,13 @@ export default function App() {
             }
 
             lastCloudSignature.current = getTripDataSignature(remoteTrip);
+            setTripInfo(createTripInfoFromCloud(selectedTripId, remoteTrip));
             setStops(remoteTrip.stops);
             setDays(remoteTrip.days);
             setTodos(remoteTrip.todos);
             setDocuments(remoteTrip.documents);
             setSurprises(remoteTrip.surprises);
+            setSelectedStopId(remoteTrip.stops.find(isMapPlaceStop)?.id ?? remoteTrip.stops[0]?.id ?? '');
             setCloudReady(true);
           },
           onStatus: (status) => {
@@ -581,6 +844,7 @@ export default function App() {
               setCloudSyncStatus(status);
             }
           },
+          tripId: selectedTripId,
         });
       } catch {
         if (mounted) {
@@ -595,21 +859,14 @@ export default function App() {
       mounted = false;
       unsubscribe?.();
     };
-  }, [storageReady]);
+  }, [selectedTripId, storageReady]);
 
   useEffect(() => {
-    if (!storageReady || !cloudReady || !cloudDeviceId || !isFirebaseSyncConfigured()) {
+    if (!storageReady || !cloudReady || !cloudDeviceId || !selectedTripId || !isFirebaseSyncConfigured()) {
       return;
     }
 
-    const tripData = createCloudTripData({
-      dataVersion: DATA_VERSION,
-      days,
-      documents,
-      stops,
-      surprises,
-      todos,
-    });
+    const tripData = createCloudTripData(createCloudTripDataFromTrip(trip, DATA_VERSION));
     const signature = getTripDataSignature(tripData);
 
     if (signature === lastCloudSignature.current) {
@@ -618,7 +875,7 @@ export default function App() {
 
     const timer = setTimeout(() => {
       setCloudSyncStatus('Cloud saving...');
-      saveTripToCloud(tripData, cloudDeviceId)
+      saveTripToCloud(selectedTripId, tripData, cloudDeviceId)
         .then(() => {
           lastCloudSignature.current = signature;
           setCloudSyncStatus('Cloud synced');
@@ -629,7 +886,7 @@ export default function App() {
     }, 300);
 
     return () => clearTimeout(timer);
-  }, [cloudDeviceId, cloudReady, days, documents, storageReady, stops, surprises, todos]);
+  }, [cloudDeviceId, cloudReady, selectedTripId, storageReady, trip]);
 
   useEffect(() => {
     const query = `${stepTitle} ${stepCity}`.trim();
@@ -753,6 +1010,242 @@ export default function App() {
     () => getSurprisesForDate(visibleSurprises, visibleDates[1], trip.stops),
     [trip.stops, visibleDates, visibleSurprises],
   );
+
+  async function createProfile() {
+    const username = normalizeUsername(profileName);
+    const email = profileEmail.trim().toLowerCase();
+    const password = profilePassword.trim();
+
+    if (!isFirebaseSyncConfigured()) {
+      setAuthError('Firebase login is not configured for this build.');
+      return;
+    }
+
+    if (username.length < 3) {
+      setAuthError('Choose a username with at least 3 letters or numbers.');
+      return;
+    }
+
+    if (!email.includes('@') || !email.includes('.')) {
+      setAuthError('Add a valid email address.');
+      return;
+    }
+
+    if (password.length < 6) {
+      setAuthError('Password must be at least 6 characters.');
+      return;
+    }
+
+    try {
+      setAuthError('');
+      const nextProfile = await createCloudAccount({
+        email,
+        password,
+        photoUri: profilePhotoUri,
+        username,
+      });
+      await SecureStore.setItemAsync(PROFILE_KEY, JSON.stringify(nextProfile));
+      await SecureStore.setItemAsync(TRIP_LIST_LAST_PROFILE_KEY, nextProfile.normalizedName);
+      setProfile(nextProfile);
+      setLoggedIn(true);
+      setAuthError('');
+      setProfileName(nextProfile.username);
+      setProfileEmail(nextProfile.email);
+      setProfilePassword('');
+    } catch (error) {
+      setAuthError(getAccountErrorMessage(error));
+    }
+  }
+
+  async function loginProfile() {
+    const identifier = profileName.trim();
+    const password = profilePassword.trim();
+
+    if (!isFirebaseSyncConfigured()) {
+      setAuthError('Firebase login is not configured for this build.');
+      return;
+    }
+
+    if (!identifier || !password) {
+      setAuthError('Add your username/email and password.');
+      return;
+    }
+
+    try {
+      setAuthError('');
+      const nextProfile = await signInCloudAccount(identifier, password);
+      await SecureStore.setItemAsync(PROFILE_KEY, JSON.stringify(nextProfile));
+      await SecureStore.setItemAsync(TRIP_LIST_LAST_PROFILE_KEY, nextProfile.normalizedName);
+      setProfile(nextProfile);
+      setProfileName(nextProfile.username);
+      setProfileEmail(nextProfile.email);
+      setProfilePhotoUri(nextProfile.photoUri ?? '');
+      setLoggedIn(true);
+      setAuthError('');
+      setProfilePassword('');
+    } catch (error) {
+      setAuthError(getAccountErrorMessage(error));
+    }
+  }
+
+  async function logoutProfile() {
+    closeTrip();
+    if (isFirebaseSyncConfigured()) {
+      await signOutCloudAccount().catch(() => undefined);
+    }
+    setLoggedIn(false);
+    setProfilePassword('');
+  }
+
+  function closeTrip() {
+    setSelectedTripId('');
+    setSelectedTripSummary(undefined);
+    setOwnerMode(false);
+    setActiveTab('map');
+    setSettingsVisible(false);
+  }
+
+  async function selectTrip(summary: TripSummary) {
+    if (!profile || !isTripAccessible(summary, profile)) {
+      return;
+    }
+
+    if (summary.isPrivate && summary.createdByProfileId !== profile.id) {
+      setTripPasswordGate(summary);
+      setTripPasswordEntry('');
+      setTripPasswordError('');
+      return;
+    }
+
+    await openTrip(summary);
+  }
+
+  async function submitTripPassword() {
+    if (!tripPasswordGate) {
+      return;
+    }
+
+    if ((tripPasswordGate.password ?? '') !== tripPasswordEntry.trim()) {
+      setTripPasswordError('Wrong trip password.');
+      return;
+    }
+
+    const summary = tripPasswordGate;
+    setTripPasswordGate(undefined);
+    setTripPasswordEntry('');
+    setTripPasswordError('');
+    await openTrip(summary);
+  }
+
+  async function openTrip(summary: TripSummary) {
+    setSelectedTripSummary(summary);
+    setSelectedTripId(summary.id);
+    setActiveTab('map');
+    setOwnerMode(false);
+    setSettingsVisible(false);
+    setPlaceCardVisible(false);
+    setSurpriseCardVisible(false);
+  }
+
+  async function createNewTrip() {
+    if (!profile) {
+      return;
+    }
+
+    const title = newTripName.trim();
+
+    if (!title) {
+      setNewTripError('Add a trip name.');
+      return;
+    }
+
+    const newTrip = createBlankTrip(title, profile);
+    const summary: TripSummary = {
+      createdAt: new Date().toISOString(),
+      createdByProfileId: profile.id,
+      id: newTrip.id,
+      isPrivate: Boolean(newTripPassword.trim()),
+      memberIds: [profile.id],
+      memberNames: [profile.username],
+      ownerName: profile.username,
+      password: newTripPassword.trim() || undefined,
+      startsAt: newTrip.startsAt,
+      title: newTrip.title,
+      updatedAt: new Date().toISOString(),
+    };
+
+    setTripInfo(createTripInfo(newTrip));
+    setStops(newTrip.stops);
+    setDays(newTrip.days);
+    setTodos(newTrip.todos);
+    setDocuments(newTrip.documents);
+    setSurprises(newTrip.surprises);
+    setSelectedStopId('');
+    setNewTripError('');
+    setNewTripName('');
+    setNewTripPassword('');
+    setTripSummaries((current) => mergeTripSummaries(current, [summary]));
+
+    if (isFirebaseSyncConfigured()) {
+      try {
+        const deviceId = cloudDeviceId || await getOrCreateCloudDeviceId();
+        setCloudDeviceId(deviceId);
+        await createTripOnCloud({
+          deviceId,
+          summary,
+          trip: createCloudTripDataFromTrip(newTrip, DATA_VERSION),
+        });
+      } catch {
+        setTripListStatus('Trip created locally; cloud will retry after opening.');
+      }
+    }
+
+    await openTrip(summary);
+  }
+
+  async function inviteMemberToTrip() {
+    if (!profile || !selectedTripSummary || !inviteName.trim()) {
+      setInviteStatus('Add a username or email to invite.');
+      return;
+    }
+
+    if (!isFirebaseSyncConfigured()) {
+      setInviteStatus('Firebase login is needed for invites.');
+      return;
+    }
+
+    try {
+      const invitedProfile = await findUserProfile(inviteName);
+
+      if (!invitedProfile) {
+        setInviteStatus('No account found with that username or email.');
+        return;
+      }
+
+      const nextSummary: TripSummary = {
+        ...selectedTripSummary,
+        memberIds: uniqueValues([...(selectedTripSummary.memberIds ?? []), invitedProfile.id, profile.id]),
+        memberNames: normalizeMemberNames([
+          ...selectedTripSummary.memberNames,
+          invitedProfile.username,
+          profile.username,
+        ]),
+        updatedAt: new Date().toISOString(),
+      };
+
+      await saveTripSummaryToCloud(nextSummary);
+      setSelectedTripSummary(nextSummary);
+      setTripSummaries((current) => mergeTripSummaries(current, [nextSummary]));
+      setTripInfo((current) => ({
+        ...current,
+        travelers: uniqueValues([...current.travelers, invitedProfile.username]),
+      }));
+      setInviteName('');
+      setInviteStatus(`${invitedProfile.username} is invited to this trip.`);
+    } catch {
+      setInviteStatus('Invite failed. Check the username/email and try again.');
+    }
+  }
 
   function handleOwnerGestureStep(step: string) {
     if (!settingsVisible) {
@@ -937,7 +1430,7 @@ export default function App() {
   }
 
   async function enableSurpriseNotifications() {
-    if (!cloudDeviceId) {
+    if (!cloudDeviceId || !selectedTripId) {
       setPushStatus('Cloud sync must connect first');
       return;
     }
@@ -945,7 +1438,7 @@ export default function App() {
     try {
       setPushStatus('Requesting permission...');
       const device = await registerForSurprisePushNotifications(cloudDeviceId);
-      await savePushDeviceToCloud(device);
+      await savePushDeviceToCloud(selectedTripId, device);
       setPushDevices((current) => ({ ...current, [device.deviceId]: device }));
       setPushStatus('Notifications on');
     } catch {
@@ -1307,18 +1800,85 @@ export default function App() {
     );
   }
 
+  if (!authReady) {
+    return (
+      <SafeAreaView style={[styles.shell, styles.centeredScreen, { backgroundColor: theme.background }]}>
+        <StatusBar style={themeKey === 'dark' ? 'light' : 'dark'} />
+        <Text style={[styles.title, { color: theme.text }]}>Roundtrip</Text>
+        <Text style={[styles.bodyText, { color: theme.muted }]}>Loading your travel planner...</Text>
+      </SafeAreaView>
+    );
+  }
+
+  if (!loggedIn) {
+    return (
+      <SafeAreaView style={[styles.shell, { backgroundColor: theme.background }]}>
+        <StatusBar style={themeKey === 'dark' ? 'light' : 'dark'} />
+        <ProfileGateScreen
+          authError={authError}
+          authMode={authMode}
+          createProfile={createProfile}
+          existingProfile={profile}
+          loginProfile={loginProfile}
+          profileEmail={profileEmail}
+          profileName={profileName}
+          profilePassword={profilePassword}
+          profilePhotoUri={profilePhotoUri}
+          setAuthMode={setAuthMode}
+          setProfileEmail={setProfileEmail}
+          setProfileName={setProfileName}
+          setProfilePassword={setProfilePassword}
+          setProfilePhotoUri={setProfilePhotoUri}
+          theme={theme}
+        />
+      </SafeAreaView>
+    );
+  }
+
+  if (!selectedTripId) {
+    return (
+      <SafeAreaView style={[styles.shell, { backgroundColor: theme.background }]}>
+        <StatusBar style={themeKey === 'dark' ? 'light' : 'dark'} />
+        <TripPickerScreen
+          createNewTrip={createNewTrip}
+          logoutProfile={logoutProfile}
+          newTripError={newTripError}
+          newTripName={newTripName}
+          newTripPassword={newTripPassword}
+          profile={profile}
+          selectTrip={selectTrip}
+          setNewTripName={setNewTripName}
+          setNewTripPassword={setNewTripPassword}
+          theme={theme}
+          tripListStatus={tripListStatus}
+          trips={availableTrips}
+        />
+        <TripPasswordModal
+          error={tripPasswordError}
+          onClose={() => setTripPasswordGate(undefined)}
+          onSubmit={submitTripPassword}
+          password={tripPasswordEntry}
+          setPassword={setTripPasswordEntry}
+          theme={theme}
+          trip={tripPasswordGate}
+          visible={Boolean(tripPasswordGate)}
+        />
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={[styles.shell, { backgroundColor: theme.background }]}>
       <StatusBar style={themeKey === 'dark' ? 'light' : 'dark'} />
       <View style={styles.header}>
         <View style={styles.headerText}>
           <Text style={[styles.eyebrow, { color: theme.muted }]}>Roundtrip</Text>
-          <Text style={[styles.title, { color: theme.text }]}>{sampleTrip.title}</Text>
+          <Text style={[styles.title, { color: theme.text }]}>{trip.title}</Text>
         </View>
         <View style={styles.headerActions}>
           <View style={[styles.datePill, { backgroundColor: theme.surface, borderColor: theme.border }]}>
             <Plane size={17} color={theme.accentDark} />
-            <Text style={[styles.datePillText, { color: theme.text }]}>Aug 2-31</Text>
+            <Text style={[styles.datePillText, { color: theme.text }]}>{getTripDateRangeLabel(trip)}</Text>
           </View>
           <Pressable
             accessibilityRole="button"
@@ -1509,10 +2069,18 @@ export default function App() {
       />
 
       <SettingsModal
+        appVersion={APP_VERSION}
+        inviteName={inviteName}
+        inviteStatus={inviteStatus}
         onEnableNotifications={enableSurpriseNotifications}
+        onInviteMember={inviteMemberToTrip}
         onClose={closeSettings}
         onHiddenGestureStep={handleOwnerGestureStep}
+        onLogout={closeTrip}
         pushStatus={pushStatus}
+        profile={profile}
+        selectedTripSummary={selectedTripSummary}
+        setInviteName={setInviteName}
         setThemeKey={setThemeKey}
         syncStatus={cloudSyncStatus}
         theme={theme}
@@ -1530,6 +2098,339 @@ export default function App() {
         visible={gateVisible}
       />
     </SafeAreaView>
+  );
+}
+
+function ProfileGateScreen({
+  authError,
+  authMode,
+  createProfile,
+  existingProfile,
+  loginProfile,
+  profileEmail,
+  profileName,
+  profilePassword,
+  profilePhotoUri,
+  setAuthMode,
+  setProfileEmail,
+  setProfileName,
+  setProfilePassword,
+  setProfilePhotoUri,
+  theme,
+}: {
+  authError: string;
+  authMode: AuthMode;
+  createProfile: () => void;
+  existingProfile?: UserProfile;
+  loginProfile: () => void;
+  profileEmail: string;
+  profileName: string;
+  profilePassword: string;
+  profilePhotoUri: string;
+  setAuthMode: (mode: AuthMode) => void;
+  setProfileEmail: (value: string) => void;
+  setProfileName: (value: string) => void;
+  setProfilePassword: (value: string) => void;
+  setProfilePhotoUri: (value: string) => void;
+  theme: (typeof themes)[ThemeKey];
+}) {
+  const isCreate = authMode === 'create';
+  const canSubmit =
+    profileName.trim().length > 0 &&
+    profilePassword.trim().length > 0 &&
+    (!isCreate || profileEmail.trim().length > 0);
+
+  return (
+    <KeyboardAvoidingView
+      behavior={Platform.select({ ios: 'padding', android: undefined })}
+      style={styles.flexOne}
+    >
+      <ScrollView contentContainerStyle={styles.authScreen} keyboardShouldPersistTaps="handled">
+        <View style={styles.profileHero}>
+          <View style={[styles.profileAvatar, { backgroundColor: theme.accentDark }]}>
+            {profilePhotoUri.trim() ? (
+              <Image source={{ uri: profilePhotoUri.trim() }} style={styles.profileAvatarImage} />
+            ) : (
+              <Text style={styles.profileAvatarText}>
+                {getProfileInitials(profileName || existingProfile?.username || 'RT')}
+              </Text>
+            )}
+          </View>
+          <View style={styles.flexOne}>
+            <Text style={[styles.eyebrow, { color: theme.muted }]}>Trip planner</Text>
+            <Text style={[styles.title, { color: theme.text }]}>
+              {isCreate ? 'Create profile' : 'Welcome back'}
+            </Text>
+          </View>
+        </View>
+
+        <View style={[styles.primaryPanel, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+          <View style={styles.segmentRow}>
+            {(['login', 'create'] as AuthMode[]).map((mode) => (
+              <Pressable
+                accessibilityRole="button"
+                key={mode}
+                onPress={() => setAuthMode(mode)}
+                style={[
+                  styles.segment,
+                  { backgroundColor: theme.surface, borderColor: theme.border },
+                  authMode === mode && { backgroundColor: theme.text, borderColor: theme.text },
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.segmentText,
+                    { color: theme.text },
+                    authMode === mode && { color: theme.surface },
+                  ]}
+                >
+                  {mode === 'login' ? 'Login' : 'New'}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+
+          <Text style={[styles.controlLabel, { color: theme.muted }]}>
+            {isCreate ? 'Username' : 'Username or email'}
+          </Text>
+          <TextInput
+            autoCapitalize="none"
+            onChangeText={setProfileName}
+            placeholder={isCreate ? 'olivier' : 'olivier or email@example.com'}
+            placeholderTextColor="#8A92A3"
+            style={[styles.input, { borderColor: theme.border, color: theme.text, backgroundColor: theme.surface }]}
+            value={profileName}
+          />
+          {isCreate && (
+            <>
+              <Text style={[styles.controlLabel, { color: theme.muted }]}>Email</Text>
+              <TextInput
+                autoCapitalize="none"
+                keyboardType="email-address"
+                onChangeText={setProfileEmail}
+                placeholder="email@example.com"
+                placeholderTextColor="#8A92A3"
+                style={[styles.input, { borderColor: theme.border, color: theme.text, backgroundColor: theme.surface }]}
+                value={profileEmail}
+              />
+            </>
+          )}
+          <Text style={[styles.controlLabel, { color: theme.muted }]}>Password</Text>
+          <TextInput
+            onChangeText={setProfilePassword}
+            placeholder="Password"
+            placeholderTextColor="#8A92A3"
+            secureTextEntry
+            style={[styles.input, { borderColor: theme.border, color: theme.text, backgroundColor: theme.surface }]}
+            value={profilePassword}
+          />
+          {isCreate && (
+            <>
+              <Text style={[styles.controlLabel, { color: theme.muted }]}>Profile photo link</Text>
+              <TextInput
+                autoCapitalize="none"
+                onChangeText={setProfilePhotoUri}
+                placeholder="Optional image URL"
+                placeholderTextColor="#8A92A3"
+                style={[styles.input, { borderColor: theme.border, color: theme.text, backgroundColor: theme.surface }]}
+                value={profilePhotoUri}
+              />
+            </>
+          )}
+          {authError ? <Text style={styles.errorText}>{authError}</Text> : null}
+          <Pressable
+            accessibilityRole="button"
+            disabled={!canSubmit}
+            onPress={isCreate ? createProfile : loginProfile}
+            style={[
+              styles.addButton,
+              { backgroundColor: theme.text },
+              !canSubmit && styles.addButtonDisabled,
+            ]}
+          >
+            <KeyRound size={18} color={theme.surface} />
+            <Text style={[styles.addButtonText, { color: theme.surface }]}>
+              {isCreate ? 'Create profile' : 'Login'}
+            </Text>
+          </Pressable>
+        </View>
+      </ScrollView>
+    </KeyboardAvoidingView>
+  );
+}
+
+function TripPickerScreen({
+  createNewTrip,
+  logoutProfile,
+  newTripError,
+  newTripName,
+  newTripPassword,
+  profile,
+  selectTrip,
+  setNewTripName,
+  setNewTripPassword,
+  theme,
+  tripListStatus,
+  trips,
+}: {
+  createNewTrip: () => void;
+  logoutProfile: () => void;
+  newTripError: string;
+  newTripName: string;
+  newTripPassword: string;
+  profile?: UserProfile;
+  selectTrip: (trip: TripSummary) => void;
+  setNewTripName: (value: string) => void;
+  setNewTripPassword: (value: string) => void;
+  theme: (typeof themes)[ThemeKey];
+  tripListStatus: string;
+  trips: TripSummary[];
+}) {
+  return (
+    <ScrollView contentContainerStyle={styles.screenContent} keyboardShouldPersistTaps="handled">
+      <View style={styles.header}>
+        <View style={styles.headerText}>
+          <Text style={[styles.eyebrow, { color: theme.muted }]}>Profile</Text>
+          <Text style={[styles.title, { color: theme.text }]}>{profile?.username ?? 'Traveler'}</Text>
+        </View>
+        <Pressable
+          accessibilityRole="button"
+          onPress={logoutProfile}
+          style={[styles.iconButton, { backgroundColor: theme.surface, borderColor: theme.border }]}
+        >
+          <X size={20} color={theme.text} />
+        </Pressable>
+      </View>
+
+      <View style={[styles.primaryPanel, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+        <View style={styles.panelHeader}>
+          <View style={styles.flexOne}>
+            <Text style={[styles.eyebrow, { color: theme.muted }]}>Existing trips</Text>
+            <Text style={[styles.panelTitle, { color: theme.text }]}>Choose trip</Text>
+          </View>
+          <Text style={[styles.compactMeta, { color: theme.muted }]}>{tripListStatus}</Text>
+        </View>
+        {trips.map((trip) => (
+          <Pressable
+            accessibilityRole="button"
+            key={trip.id}
+            onPress={() => selectTrip(trip)}
+            style={[styles.tripRow, { backgroundColor: theme.softSurface, borderColor: theme.border }]}
+          >
+            <View style={[styles.tripIcon, { backgroundColor: trip.isPrivate ? theme.text : theme.accentDark }]}>
+              {trip.isPrivate ? <KeyRound size={18} color={theme.surface} /> : <Plane size={18} color="#FFFFFF" />}
+            </View>
+            <View style={styles.flexOne}>
+              <Text style={[styles.compactTitle, { color: theme.text }]}>{trip.title}</Text>
+              <Text style={[styles.compactMeta, { color: theme.muted }]}>
+                {trip.memberIds?.length ?? trip.memberNames.length} travelers - {trip.isPrivate ? 'Private' : 'Public'}
+              </Text>
+            </View>
+            <ExternalLink size={16} color={theme.text} />
+          </Pressable>
+        ))}
+      </View>
+
+      <View style={[styles.primaryPanel, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+        <View style={styles.panelHeader}>
+          <View style={styles.flexOne}>
+            <Text style={[styles.eyebrow, { color: theme.muted }]}>New trip</Text>
+            <Text style={[styles.panelTitle, { color: theme.text }]}>Start planning</Text>
+          </View>
+          <Plus size={22} color={theme.accent} />
+        </View>
+        <TextInput
+          onChangeText={setNewTripName}
+          placeholder="Trip name"
+          placeholderTextColor="#8A92A3"
+          style={[styles.input, { borderColor: theme.border, color: theme.text, backgroundColor: theme.surface }]}
+          value={newTripName}
+        />
+        <TextInput
+          onChangeText={setNewTripPassword}
+          placeholder="Optional trip password"
+          placeholderTextColor="#8A92A3"
+          secureTextEntry
+          style={[styles.input, { borderColor: theme.border, color: theme.text, backgroundColor: theme.surface }]}
+          value={newTripPassword}
+        />
+        {newTripError ? <Text style={styles.errorText}>{newTripError}</Text> : null}
+        <Pressable
+          accessibilityRole="button"
+          onPress={createNewTrip}
+          style={[styles.addButton, { backgroundColor: theme.accent }]}
+        >
+          <Plus size={18} color="#FFFFFF" />
+          <Text style={styles.addButtonText}>Create trip</Text>
+        </Pressable>
+      </View>
+    </ScrollView>
+  );
+}
+
+function TripPasswordModal({
+  error,
+  onClose,
+  onSubmit,
+  password,
+  setPassword,
+  theme,
+  trip,
+  visible,
+}: {
+  error: string;
+  onClose: () => void;
+  onSubmit: () => void;
+  password: string;
+  setPassword: (value: string) => void;
+  theme: (typeof themes)[ThemeKey];
+  trip?: TripSummary;
+  visible: boolean;
+}) {
+  return (
+    <Modal animationType="fade" transparent visible={visible}>
+      <KeyboardAvoidingView
+        behavior={Platform.select({ ios: 'padding', android: undefined })}
+        style={styles.modalBackdrop}
+      >
+        <View style={[styles.gatePanel, { backgroundColor: theme.surface }]}>
+          <View style={styles.panelHeader}>
+            <View style={styles.flexOne}>
+              <Text style={[styles.eyebrow, { color: theme.muted }]}>Private trip</Text>
+              <Text style={[styles.panelTitle, { color: theme.text }]}>{trip?.title ?? 'Trip password'}</Text>
+            </View>
+            <Pressable
+              accessibilityRole="button"
+              onPress={onClose}
+              style={[styles.iconButton, { backgroundColor: theme.softSurface }]}
+            >
+              <X size={20} color={theme.text} />
+            </Pressable>
+          </View>
+          <TextInput
+            autoFocus
+            onChangeText={setPassword}
+            placeholder="Trip password"
+            placeholderTextColor="#8A92A3"
+            secureTextEntry
+            style={[
+              styles.pinInput,
+              { backgroundColor: theme.softSurface, borderColor: theme.border, color: theme.text },
+            ]}
+            value={password}
+          />
+          {error ? <Text style={styles.errorText}>{error}</Text> : null}
+          <Pressable
+            accessibilityRole="button"
+            onPress={onSubmit}
+            style={[styles.unlockButton, { backgroundColor: theme.text }]}
+          >
+            <KeyRound size={18} color={theme.surface} />
+            <Text style={[styles.unlockButtonText, { color: theme.surface }]}>Open trip</Text>
+          </Pressable>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
   );
 }
 
@@ -3354,17 +4255,33 @@ function MomentsScreen({
 }
 
 function SettingsScreen({
+  appVersion,
+  inviteName,
+  inviteStatus,
   onEnableNotifications,
   onHiddenGestureStep,
+  onInviteMember,
+  onLogout,
   pushStatus,
+  profile,
+  selectedTripSummary,
+  setInviteName,
   setThemeKey,
   syncStatus,
   theme,
   themeKey,
 }: {
+  appVersion: string;
+  inviteName: string;
+  inviteStatus: string;
   onEnableNotifications: () => void;
   onHiddenGestureStep: (step: string) => void;
+  onInviteMember: () => void;
+  onLogout: () => void;
   pushStatus: string;
+  profile?: UserProfile;
+  selectedTripSummary?: TripSummary;
+  setInviteName: (value: string) => void;
   setThemeKey: (themeKey: ThemeKey) => void;
   syncStatus: string;
   theme: (typeof themes)[ThemeKey];
@@ -3417,6 +4334,40 @@ function SettingsScreen({
         <Text style={[styles.compactTitle, { color: theme.text }]}>{syncStatus}</Text>
       </View>
       <View style={[styles.primaryPanel, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+        <Text style={[styles.eyebrow, { color: theme.muted }]}>Trip</Text>
+        <Text style={[styles.compactTitle, { color: theme.text }]}>
+          {selectedTripSummary?.title ?? 'Selected trip'}
+        </Text>
+        <Text style={[styles.compactMeta, { color: theme.muted }]}>
+          {profile?.username ?? 'Traveler'} - version {appVersion}
+        </Text>
+        <TextInput
+          autoCapitalize="none"
+          onChangeText={setInviteName}
+          placeholder="Invite by username or email"
+          placeholderTextColor="#8A92A3"
+          style={[styles.input, { borderColor: theme.border, color: theme.text, backgroundColor: theme.surface }]}
+          value={inviteName}
+        />
+        {inviteStatus ? <Text style={[styles.compactMeta, { color: theme.accentDark }]}>{inviteStatus}</Text> : null}
+        <Pressable
+          accessibilityRole="button"
+          onPress={onInviteMember}
+          style={[styles.addButton, { backgroundColor: theme.accentDark }]}
+        >
+          <Plus size={18} color="#FFFFFF" />
+          <Text style={styles.addButtonText}>Invite traveler</Text>
+        </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          onPress={onLogout}
+          style={[styles.addButton, { backgroundColor: theme.softSurface }]}
+        >
+          <X size={18} color={theme.text} />
+          <Text style={[styles.addButtonText, { color: theme.text }]}>Back to trips</Text>
+        </Pressable>
+      </View>
+      <View style={[styles.primaryPanel, { backgroundColor: theme.surface, borderColor: theme.border }]}>
         <Text style={[styles.eyebrow, { color: theme.muted }]}>Notifications</Text>
         <Text style={[styles.compactTitle, { color: theme.text }]}>{pushStatus}</Text>
         <Pressable
@@ -3433,20 +4384,36 @@ function SettingsScreen({
 }
 
 function SettingsModal({
+  appVersion,
+  inviteName,
+  inviteStatus,
   onEnableNotifications,
   onClose,
   onHiddenGestureStep,
+  onInviteMember,
+  onLogout,
   pushStatus,
+  profile,
+  selectedTripSummary,
+  setInviteName,
   setThemeKey,
   syncStatus,
   theme,
   themeKey,
   visible,
 }: {
+  appVersion: string;
+  inviteName: string;
+  inviteStatus: string;
   onEnableNotifications: () => void;
   onClose: () => void;
   onHiddenGestureStep: (step: string) => void;
+  onInviteMember: () => void;
+  onLogout: () => void;
   pushStatus: string;
+  profile?: UserProfile;
+  selectedTripSummary?: TripSummary;
+  setInviteName: (value: string) => void;
   setThemeKey: (themeKey: ThemeKey) => void;
   syncStatus: string;
   theme: (typeof themes)[ThemeKey];
@@ -3468,9 +4435,17 @@ function SettingsModal({
             </Pressable>
           </View>
           <SettingsScreen
+            appVersion={appVersion}
+            inviteName={inviteName}
+            inviteStatus={inviteStatus}
             onEnableNotifications={onEnableNotifications}
             onHiddenGestureStep={onHiddenGestureStep}
+            onInviteMember={onInviteMember}
+            onLogout={onLogout}
             pushStatus={pushStatus}
+            profile={profile}
+            selectedTripSummary={selectedTripSummary}
+            setInviteName={setInviteName}
             setThemeKey={setThemeKey}
             syncStatus={syncStatus}
             theme={theme}
@@ -4117,6 +5092,13 @@ function formatDate(value: string) {
   }).format(new Date(`${value}T12:00:00`));
 }
 
+function formatShortDateTime(value: string) {
+  return new Intl.DateTimeFormat('en', {
+    month: 'short',
+    day: 'numeric',
+  }).format(new Date(value));
+}
+
 function formatWeekday(value: string) {
   return new Intl.DateTimeFormat('en', {
     weekday: 'short',
@@ -4128,6 +5110,46 @@ function formatTime(value: string) {
     hour: '2-digit',
     minute: '2-digit',
   }).format(new Date(value));
+}
+
+function getProfileInitials(value: string) {
+  const words = value.trim().split(/\s+/).filter(Boolean);
+
+  if (!words.length) {
+    return 'RT';
+  }
+
+  return words.slice(0, 2).map((word) => word[0]?.toUpperCase()).join('');
+}
+
+function getAccountErrorMessage(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+
+  if (message.includes('USERNAME_TAKEN')) {
+    return 'That username is already taken.';
+  }
+
+  if (message.includes('USER_NOT_FOUND') || message.includes('USER_PROFILE_NOT_FOUND')) {
+    return 'No account found with that username or email.';
+  }
+
+  if (message.includes('auth/email-already-in-use')) {
+    return 'That email already has an account.';
+  }
+
+  if (message.includes('auth/invalid-credential') || message.includes('auth/wrong-password')) {
+    return 'Wrong username/email or password.';
+  }
+
+  if (message.includes('auth/invalid-email')) {
+    return 'Use a valid email address.';
+  }
+
+  if (message.includes('auth/weak-password')) {
+    return 'Password must be at least 6 characters.';
+  }
+
+  return 'Account action failed. Please try again.';
 }
 
 const styles = StyleSheet.create({
@@ -4177,9 +5199,21 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 20,
   },
+  authScreen: {
+    gap: 16,
+    padding: 18,
+    paddingBottom: 42,
+    paddingTop: 24,
+  },
   calendarDateCell: {
     alignItems: 'center',
     width: 46,
+  },
+  centeredScreen: {
+    alignItems: 'center',
+    gap: 8,
+    justifyContent: 'center',
+    padding: 24,
   },
   calendarDay: {
     fontSize: 20,
@@ -4727,6 +5761,30 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     padding: 16,
   },
+  profileAvatar: {
+    alignItems: 'center',
+    borderRadius: 8,
+    height: 58,
+    justifyContent: 'center',
+    overflow: 'hidden',
+    width: 58,
+  },
+  profileAvatarImage: {
+    height: '100%',
+    width: '100%',
+  },
+  profileAvatarText: {
+    color: '#FFFFFF',
+    fontSize: 18,
+    fontWeight: '900',
+  },
+  profileHero: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 2,
+    marginTop: 4,
+  },
   revealButton: {
     alignItems: 'center',
     alignSelf: 'flex-start',
@@ -5015,6 +6073,24 @@ const styles = StyleSheet.create({
     fontSize: 26,
     fontWeight: '900',
     marginTop: 1,
+  },
+  tripIcon: {
+    alignItems: 'center',
+    borderRadius: 8,
+    height: 38,
+    justifyContent: 'center',
+    width: 38,
+  },
+  tripRow: {
+    alignItems: 'center',
+    borderRadius: 8,
+    borderWidth: 1,
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 10,
+    minHeight: 58,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
   },
   todoCard: {
     alignItems: 'flex-start',

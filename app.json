@@ -2,14 +2,14 @@
   "expo": {
     "name": "Roundtrip Surprise",
     "slug": "roundtrip-surprise",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "scheme": "roundtripsurprise",
     "userInterfaceStyle": "light",
     "ios": {
       "bundleIdentifier": "com.oliviergianoli.roundtripsurprise",
-      "buildNumber": "8",
+      "buildNumber": "9",
       "supportsTablet": false,
       "usesNonExemptEncryption": false,
       "infoPlist": {

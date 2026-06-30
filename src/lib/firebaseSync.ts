@@ -1,16 +1,31 @@
 import { getApps, initializeApp } from 'firebase/app';
 import type { FirebaseOptions } from 'firebase/app';
-import { getAuth, signInAnonymously } from 'firebase/auth';
 import {
+  createUserWithEmailAndPassword,
+  deleteUser,
+  getAuth,
+  signInWithEmailAndPassword,
+  signOut,
+  updateProfile,
+} from 'firebase/auth';
+import {
+  collection,
   doc,
+  getDoc,
+  getDocs,
   getFirestore,
+  limit,
   onSnapshot,
+  query,
+  runTransaction,
   serverTimestamp,
   setDoc,
+  where,
 } from 'firebase/firestore';
 
 import {
   SurpriseStop,
+  Trip,
   TripDay,
   TripDocument,
   TripStop,
@@ -34,9 +49,14 @@ export type CloudTripData = {
   dataVersion: string;
   days: TripDay[];
   documents: TripDocument[];
+  endsAt: string;
+  homeTimezone: string;
   stops: TripStop[];
   surprises: SurpriseStop[];
+  title: string;
   todos: TripTodo[];
+  travelers: string[];
+  startsAt: string;
 };
 
 type CloudTripDocument = {
@@ -46,12 +66,36 @@ type CloudTripDocument = {
   updatedByDeviceId?: string;
 };
 
+export type TripSummary = {
+  createdAt?: string;
+  createdByProfileId: string;
+  id: string;
+  isPrivate: boolean;
+  memberIds?: string[];
+  memberNames: string[];
+  ownerName: string;
+  password?: string;
+  startsAt?: string;
+  title: string;
+  updatedAt?: string;
+};
+
+export type CloudUserProfile = {
+  email: string;
+  id: string;
+  name: string;
+  normalizedName: string;
+  photoUri?: string;
+  username: string;
+};
+
 type StartCloudSyncOptions = {
   deviceId: string;
   onMissingTrip: () => void;
   onRemotePushDevices: (devices: Record<string, PushDevice>) => void;
   onRemoteTrip: (trip: CloudTripData) => void;
   onStatus: (status: string) => void;
+  tripId: string;
 };
 
 let initialized = false;
@@ -71,17 +115,17 @@ export async function startTripCloudSync({
   onRemotePushDevices,
   onRemoteTrip,
   onStatus,
+  tripId,
 }: StartCloudSyncOptions): Promise<() => void> {
   const app = getFirebaseApp();
-  const auth = getAuth(app);
   const db = getFirestore(app);
 
   onStatus('Cloud connecting...');
-  await signInAnonymously(auth);
+  requireSignedInUser();
   onStatus('Cloud listening');
 
   return onSnapshot(
-    doc(db, 'trips', getTripDocumentId()),
+    doc(db, 'trips', tripId),
     (snapshot) => {
       if (!snapshot.exists()) {
         onStatus('Cloud ready');
@@ -106,12 +150,13 @@ export async function startTripCloudSync({
   );
 }
 
-export async function saveTripToCloud(trip: CloudTripData, deviceId: string) {
+export async function saveTripToCloud(tripId: string, trip: CloudTripData, deviceId: string) {
   const app = getFirebaseApp();
   const db = getFirestore(app);
+  requireSignedInUser();
 
   await setDoc(
-    doc(db, 'trips', getTripDocumentId()),
+    doc(db, 'trips', tripId),
     {
       dataVersion: trip.dataVersion,
       trip,
@@ -122,12 +167,13 @@ export async function saveTripToCloud(trip: CloudTripData, deviceId: string) {
   );
 }
 
-export async function savePushDeviceToCloud(device: PushDevice) {
+export async function savePushDeviceToCloud(tripId: string, device: PushDevice) {
   const app = getFirebaseApp();
   const db = getFirestore(app);
+  requireSignedInUser();
 
   await setDoc(
-    doc(db, 'trips', getTripDocumentId()),
+    doc(db, 'trips', tripId),
     {
       pushDevices: {
         [device.deviceId]: device,
@@ -136,6 +182,307 @@ export async function savePushDeviceToCloud(device: PushDevice) {
     },
     { merge: true },
   );
+}
+
+export async function saveTripSummaryToCloud(summary: TripSummary) {
+  const app = getFirebaseApp();
+  const db = getFirestore(app);
+  requireSignedInUser();
+
+  await setDoc(
+    doc(db, 'tripIndex', summary.id),
+    {
+      ...summary,
+      memberIds: normalizeMemberIds(summary.memberIds ?? []),
+      memberNames: normalizeMemberNames(summary.memberNames),
+      updatedAt: new Date().toISOString(),
+    },
+    { merge: true },
+  );
+}
+
+export async function createTripOnCloud({
+  deviceId,
+  summary,
+  trip,
+}: {
+  deviceId: string;
+  summary: TripSummary;
+  trip: CloudTripData;
+}) {
+  await saveTripToCloud(summary.id, trip, deviceId);
+  await saveTripSummaryToCloud(summary);
+}
+
+export async function listenTripsForMember({
+  memberId,
+  memberName,
+  onStatus,
+  onTrips,
+}: {
+  memberId: string;
+  memberName: string;
+  onStatus: (status: string) => void;
+  onTrips: (trips: TripSummary[]) => void;
+}): Promise<() => void> {
+  const app = getFirebaseApp();
+  const db = getFirestore(app);
+  requireSignedInUser();
+
+  onStatus('Loading trips...');
+
+  const tripsByIdQuery = query(collection(db, 'tripIndex'), where('memberIds', 'array-contains', memberId));
+  const tripsByNameQuery = query(
+    collection(db, 'tripIndex'),
+    where('memberNames', 'array-contains', normalizeMemberName(memberName)),
+  );
+  const tripsBySource = new Map<string, TripSummary[]>();
+
+  const emitTrips = () => {
+    const tripsById = new Map<string, TripSummary>();
+
+    Array.from(tripsBySource.values()).flat().forEach((trip) => {
+      tripsById.set(trip.id, normalizeTripSummary(trip));
+    });
+
+    const trips = Array.from(tripsById.values()).sort((left, right) =>
+      (right.updatedAt ?? '').localeCompare(left.updatedAt ?? ''),
+    );
+
+    onTrips(trips);
+    onStatus('Trips synced');
+  };
+
+  const unsubscribeById = onSnapshot(
+    tripsByIdQuery,
+    (snapshot) => {
+      tripsBySource.set(
+        'memberIds',
+        snapshot.docs.map((tripDoc) => ({ id: tripDoc.id, ...tripDoc.data() }) as TripSummary),
+      );
+      emitTrips();
+    },
+    () => {
+      onStatus('Trip list unavailable');
+    },
+  );
+
+  const unsubscribeByName = onSnapshot(
+    tripsByNameQuery,
+    (snapshot) => {
+      tripsBySource.set(
+        'memberNames',
+        snapshot.docs.map((tripDoc) => ({ id: tripDoc.id, ...tripDoc.data() }) as TripSummary),
+      );
+      emitTrips();
+    },
+    () => {
+      onStatus('Trip list unavailable');
+    },
+  );
+
+  return () => {
+    unsubscribeById();
+    unsubscribeByName();
+  };
+}
+
+export async function createCloudAccount({
+  email,
+  password,
+  photoUri,
+  username,
+}: {
+  email: string;
+  password: string;
+  photoUri?: string;
+  username: string;
+}) {
+  const app = getFirebaseApp();
+  const auth = getAuth(app);
+  const db = getFirestore(app);
+  const normalizedUsername = normalizeUsername(username);
+  const normalizedEmail = normalizeEmail(email);
+
+  const credentials = await createUserWithEmailAndPassword(auth, normalizedEmail, password);
+  const profile: CloudUserProfile = {
+    email: normalizedEmail,
+    id: credentials.user.uid,
+    name: normalizedUsername,
+    normalizedName: normalizedUsername,
+    photoUri: photoUri?.trim() || undefined,
+    username: normalizedUsername,
+  };
+
+  try {
+    await runTransaction(db, async (transaction) => {
+      const usernameRef = doc(db, 'usernames', normalizedUsername);
+      const usernameSnapshot = await transaction.get(usernameRef);
+
+      if (usernameSnapshot.exists()) {
+        throw new Error('USERNAME_TAKEN');
+      }
+
+      transaction.set(usernameRef, {
+        createdAt: new Date().toISOString(),
+        email: normalizedEmail,
+        uid: credentials.user.uid,
+        username: normalizedUsername,
+      });
+      transaction.set(doc(db, 'users', credentials.user.uid), {
+        ...profile,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+    });
+
+    await updateProfile(credentials.user, {
+      displayName: normalizedUsername,
+      photoURL: profile.photoUri,
+    }).catch(() => undefined);
+
+    return profile;
+  } catch (error) {
+    await deleteUser(credentials.user).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function signInCloudAccount(identifier: string, password: string) {
+  const app = getFirebaseApp();
+  const auth = getAuth(app);
+  const email = identifier.includes('@')
+    ? normalizeEmail(identifier)
+    : (await getUsernameIndex(identifier))?.email;
+
+  if (!email) {
+    throw new Error('USER_NOT_FOUND');
+  }
+
+  const credentials = await signInWithEmailAndPassword(auth, email, password);
+  const profile = await getUserProfileById(credentials.user.uid);
+
+  if (!profile) {
+    throw new Error('USER_PROFILE_NOT_FOUND');
+  }
+
+  return profile;
+}
+
+export async function signOutCloudAccount() {
+  const app = getFirebaseApp();
+  await signOut(getAuth(app));
+}
+
+export async function findUserProfile(identifier: string): Promise<CloudUserProfile | undefined> {
+  const app = getFirebaseApp();
+  const db = getFirestore(app);
+  const value = identifier.trim();
+
+  if (!value) {
+    return undefined;
+  }
+
+  if (value.includes('@')) {
+    const usersQuery = query(collection(db, 'users'), where('email', '==', normalizeEmail(value)), limit(1));
+    const usersSnapshot = await getDocs(usersQuery);
+    const firstUser = usersSnapshot.docs[0];
+    return firstUser ? normalizeCloudUserProfile(firstUser.data(), firstUser.id) : undefined;
+  }
+
+  const usernameData = await getUsernameIndex(value);
+  return usernameData.uid ? getUserProfileById(usernameData.uid) : undefined;
+}
+
+export function createCloudTripDataFromTrip(trip: Trip, dataVersion: string): CloudTripData {
+  return {
+    dataVersion,
+    days: trip.days,
+    documents: trip.documents,
+    endsAt: trip.endsAt,
+    homeTimezone: trip.homeTimezone,
+    startsAt: trip.startsAt,
+    stops: trip.stops,
+    surprises: trip.surprises,
+    title: trip.title,
+    todos: trip.todos,
+    travelers: trip.travelers,
+  };
+}
+
+export function normalizeMemberName(value: string) {
+  return value.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+export function normalizeMemberNames(values: string[]) {
+  return values.map(normalizeMemberName).filter(Boolean).filter((value, index, all) => all.indexOf(value) === index);
+}
+
+export function normalizeUsername(value: string) {
+  return value.trim().replace(/^@/, '').toLowerCase().replace(/[^a-z0-9._-]/g, '');
+}
+
+function normalizeEmail(value: string) {
+  return value.trim().toLowerCase();
+}
+
+function normalizeMemberIds(values: string[]) {
+  return values.map((value) => value.trim()).filter(Boolean).filter((value, index, all) => all.indexOf(value) === index);
+}
+
+function normalizeTripSummary(summary: TripSummary): TripSummary {
+  return {
+    ...summary,
+    memberIds: normalizeMemberIds(summary.memberIds ?? []),
+    memberNames: normalizeMemberNames(summary.memberNames),
+  };
+}
+
+async function getUserProfileById(uid: string): Promise<CloudUserProfile | undefined> {
+  const app = getFirebaseApp();
+  const db = getFirestore(app);
+  const snapshot = await getDoc(doc(db, 'users', uid));
+
+  if (!snapshot.exists()) {
+    return undefined;
+  }
+
+  return normalizeCloudUserProfile(snapshot.data(), snapshot.id);
+}
+
+async function getUsernameIndex(identifier: string) {
+  const app = getFirebaseApp();
+  const db = getFirestore(app);
+  const usernameSnapshot = await getDoc(doc(db, 'usernames', normalizeUsername(identifier)));
+
+  if (!usernameSnapshot.exists()) {
+    return {};
+  }
+
+  return usernameSnapshot.data() as { email?: string; uid?: string; username?: string };
+}
+
+function normalizeCloudUserProfile(data: unknown, uid: string): CloudUserProfile {
+  const profile = data as Partial<CloudUserProfile>;
+  const username = normalizeUsername(profile.username ?? profile.name ?? 'traveler');
+
+  return {
+    email: normalizeEmail(profile.email ?? ''),
+    id: uid,
+    name: username,
+    normalizedName: username,
+    photoUri: profile.photoUri,
+    username,
+  };
+}
+
+function requireSignedInUser() {
+  const app = getFirebaseApp();
+  const user = getAuth(app).currentUser;
+
+  if (!user) {
+    throw new Error('Firebase account login is required');
+  }
 }
 
 function getFirebaseApp() {
@@ -160,8 +507,4 @@ function getFirebaseConfig(): FirebaseOptions {
     projectId: process.env.EXPO_PUBLIC_FIREBASE_PROJECT_ID,
     storageBucket: process.env.EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET,
   };
-}
-
-function getTripDocumentId() {
-  return process.env.EXPO_PUBLIC_FIREBASE_TRIP_ID || 'singapore-indonesia-2026';
 }

@@ -8,7 +8,7 @@ The app keeps local storage as the offline fallback. Firebase sync turns on only
 2. Create a Firebase project, or use an existing one.
 3. Add a Web app to the project.
 4. Copy the Firebase config values from Project settings.
-5. Enable Authentication > Sign-in method > Anonymous.
+5. Enable Authentication > Sign-in method > Email/Password.
 6. Create Firestore Database in production mode.
 
 ## EAS Environment Variables
@@ -22,7 +22,6 @@ npx eas-cli@latest env:create --environment production --visibility plaintext --
 npx eas-cli@latest env:create --environment production --visibility plaintext --name EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET --value "..."
 npx eas-cli@latest env:create --environment production --visibility plaintext --name EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID --value "..."
 npx eas-cli@latest env:create --environment production --visibility plaintext --name EXPO_PUBLIC_FIREBASE_APP_ID --value "..."
-npx eas-cli@latest env:create --environment production --visibility plaintext --name EXPO_PUBLIC_FIREBASE_TRIP_ID --value "singapore-indonesia-2026"
 ```
 
 These are safe to expose in the app bundle. Do not add Firebase service-account keys to Expo.
@@ -36,21 +35,38 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /trips/singapore-indonesia-2026 {
+    match /trips/{tripId} {
       allow read, write: if request.auth != null;
+    }
+
+    match /tripIndex/{tripId} {
+      allow read, write: if request.auth != null;
+    }
+
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    match /usernames/{username} {
+      allow read: if true;
+      allow create: if request.auth != null;
+      allow update, delete: if false;
     }
   }
 }
 ```
 
-This lets signed-in app users share the one trip document. The app signs in anonymously.
+This lets signed-in app users share trip documents and the trip list index. The username directory is readable before login so username-based login can find the account email.
 
-Before a public App Store release, tighten this with a proper member list or invite code.
+Before a public App Store release, tighten this with real authenticated users and member-based rules.
 
 ## How It Behaves
 
 - If Firebase env vars are missing, the app stays local-only.
-- If Firebase is configured, the app signs in anonymously and syncs the shared trip document.
+- If Firebase is configured, users create/login with username, email, and password.
+- Passwords are handled by Firebase Auth; Firestore only stores user profiles and username lookup entries.
+- Trip list membership is stored in `tripIndex` with Firebase user ids; the full cards/calendar/todos live in `trips`.
 - Local edits are saved locally first and pushed to Firestore with a short debounce.
 - Remote edits from another phone are pulled into the app and then cached locally.
 - Push notification device tokens are stored in the same trip document under `pushDevices`.
