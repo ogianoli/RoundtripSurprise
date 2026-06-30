@@ -73,6 +73,16 @@ Before a public App Store release, tighten this with real authenticated users an
 - Each phone must open Settings and enable surprise alerts once before it can receive reveal notifications.
 - PDF files still live locally in this version; cloud file storage for PDFs/photos should be a later pass.
 
+## Registration Troubleshooting
+
+If account creation fails:
+
+1. Check Authentication > Users.
+   - If no user was created, enable Authentication > Sign-in method > Email/Password.
+   - If a user was created but no `users/{uid}` or `usernames/{username}` document exists, Firestore rules blocked the profile write.
+2. Check Firestore Database > Rules, not Realtime Database rules.
+3. After changing rules, click Publish.
+
 Official docs:
 
 - Firebase web setup: https://firebase.google.com/docs/web/setup

@@ -5137,6 +5137,10 @@ function getAccountErrorMessage(error: unknown) {
     return 'That email already has an account.';
   }
 
+  if (message.includes('auth/operation-not-allowed')) {
+    return 'Enable Email/Password sign-in in Firebase Auth.';
+  }
+
   if (message.includes('auth/invalid-credential') || message.includes('auth/wrong-password')) {
     return 'Wrong username/email or password.';
   }
@@ -5149,7 +5153,15 @@ function getAccountErrorMessage(error: unknown) {
     return 'Password must be at least 6 characters.';
   }
 
-  return 'Account action failed. Please try again.';
+  if (message.includes('permission-denied') || message.includes('Missing or insufficient permissions')) {
+    return 'Firebase rules blocked this action. Check Firestore rules.';
+  }
+
+  if (message.includes('network-request-failed') || message.includes('unavailable')) {
+    return 'Firebase is unreachable. Check the connection and try again.';
+  }
+
+  return 'Account action failed. Check Firebase Auth and Firestore rules.';
 }
 
 const styles = StyleSheet.create({

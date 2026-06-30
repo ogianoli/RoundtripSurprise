@@ -305,6 +305,7 @@ export async function createCloudAccount({
   const normalizedEmail = normalizeEmail(email);
 
   const credentials = await createUserWithEmailAndPassword(auth, normalizedEmail, password);
+  await credentials.user.getIdToken(true);
   const profile: CloudUserProfile = {
     email: normalizedEmail,
     id: credentials.user.uid,
@@ -360,6 +361,7 @@ export async function signInCloudAccount(identifier: string, password: string) {
   }
 
   const credentials = await signInWithEmailAndPassword(auth, email, password);
+  await credentials.user.getIdToken(true);
   const profile = await getUserProfileById(credentials.user.uid);
 
   if (!profile) {
