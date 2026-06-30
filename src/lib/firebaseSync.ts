@@ -157,12 +157,12 @@ export async function saveTripToCloud(tripId: string, trip: CloudTripData, devic
 
   await setDoc(
     doc(db, 'trips', tripId),
-    {
+    stripUndefined({
       dataVersion: trip.dataVersion,
       trip,
       updatedAt: serverTimestamp(),
       updatedByDeviceId: deviceId,
-    },
+    }),
     { merge: true },
   );
 }
@@ -174,12 +174,12 @@ export async function savePushDeviceToCloud(tripId: string, device: PushDevice) 
 
   await setDoc(
     doc(db, 'trips', tripId),
-    {
+    stripUndefined({
       pushDevices: {
         [device.deviceId]: device,
       },
       updatedAt: serverTimestamp(),
-    },
+    }),
     { merge: true },
   );
 }
@@ -191,12 +191,12 @@ export async function saveTripSummaryToCloud(summary: TripSummary) {
 
   await setDoc(
     doc(db, 'tripIndex', summary.id),
-    {
+    stripUndefined({
       ...summary,
       memberIds: normalizeMemberIds(summary.memberIds ?? []),
       memberNames: normalizeMemberNames(summary.memberNames),
       updatedAt: new Date().toISOString(),
-    },
+    }),
     { merge: true },
   );
 }
@@ -303,6 +303,7 @@ export async function createCloudAccount({
   const db = getFirestore(app);
   const normalizedUsername = normalizeUsername(username);
   const normalizedEmail = normalizeEmail(email);
+  const normalizedPhotoUri = photoUri?.trim();
 
   const credentials = await createUserWithEmailAndPassword(auth, normalizedEmail, password);
   await credentials.user.getIdToken(true);
@@ -311,8 +312,8 @@ export async function createCloudAccount({
     id: credentials.user.uid,
     name: normalizedUsername,
     normalizedName: normalizedUsername,
-    photoUri: photoUri?.trim() || undefined,
     username: normalizedUsername,
+    ...(normalizedPhotoUri ? { photoUri: normalizedPhotoUri } : {}),
   };
 
   try {
@@ -324,22 +325,22 @@ export async function createCloudAccount({
         throw new Error('USERNAME_TAKEN');
       }
 
-      transaction.set(usernameRef, {
+      transaction.set(usernameRef, stripUndefined({
         createdAt: new Date().toISOString(),
         email: normalizedEmail,
         uid: credentials.user.uid,
         username: normalizedUsername,
-      });
-      transaction.set(doc(db, 'users', credentials.user.uid), {
+      }));
+      transaction.set(doc(db, 'users', credentials.user.uid), stripUndefined({
         ...profile,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-      });
+      }));
     });
 
     await updateProfile(credentials.user, {
       displayName: normalizedUsername,
-      photoURL: profile.photoUri,
+      photoURL: profile.photoUri ?? null,
     }).catch(() => undefined);
 
     return profile;
@@ -485,6 +486,22 @@ function requireSignedInUser() {
   if (!user) {
     throw new Error('Firebase account login is required');
   }
+}
+
+function stripUndefined<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => stripUndefined(item)) as T;
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, item]) => item !== undefined)
+        .map(([key, item]) => [key, stripUndefined(item)]),
+    ) as T;
+  }
+
+  return value;
 }
 
 function getFirebaseApp() {

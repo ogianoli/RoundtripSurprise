@@ -52,7 +52,7 @@ git push
 Submit the latest build to TestFlight:
 
 ```bash
-npx eas-cli@latest submit --platform ios --latest --non-interactive
+npx eas-cli@latest submit --platform ios --latest
 ```
 
 ## Firebase Before Testing
