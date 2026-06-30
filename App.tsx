@@ -52,6 +52,7 @@ import {
   createCloudAccount,
   createTripOnCloud,
   findUserProfile,
+  getCurrentCloudUserProfile,
   isFirebaseSyncConfigured,
   listenTripsForMember,
   normalizeMemberNames,
@@ -107,7 +108,6 @@ declare const process: {
     EXPO_PUBLIC_FIREBASE_API_KEY?: string;
     EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN?: string;
     EXPO_PUBLIC_FIREBASE_PROJECT_ID?: string;
-    EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET?: string;
     EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID?: string;
     EXPO_PUBLIC_FIREBASE_APP_ID?: string;
     EXPO_PUBLIC_FIREBASE_TRIP_ID?: string;
@@ -386,14 +386,56 @@ function createTripInfo(trip: Trip): TripInfo {
 }
 
 function createTripInfoFromCloud(tripId: string, trip: CloudTripData): TripInfo {
+  const fallback = createFallbackTripInfo(tripId);
+
   return {
-    endsAt: trip.endsAt,
-    homeTimezone: trip.homeTimezone,
+    endsAt: isValidDateValue(trip.endsAt) ? trip.endsAt : fallback.endsAt,
+    homeTimezone: trip.homeTimezone || fallback.homeTimezone,
     id: tripId,
-    startsAt: trip.startsAt,
-    title: trip.title,
-    travelers: trip.travelers,
+    startsAt: isValidDateValue(trip.startsAt) ? trip.startsAt : fallback.startsAt,
+    title: trip.title || fallback.title,
+    travelers: Array.isArray(trip.travelers) && trip.travelers.length ? trip.travelers : fallback.travelers,
   };
+}
+
+function normalizeCloudTripData(tripId: string, trip: Partial<CloudTripData>): CloudTripData {
+  const fallback = tripId === sampleTrip.id ? sampleTrip : undefined;
+  const fallbackDay = createEmptyTripDay(trip.title || fallback?.title || 'New trip');
+
+  return {
+    dataVersion: trip.dataVersion || DATA_VERSION,
+    days: Array.isArray(trip.days) && trip.days.length ? trip.days : fallback?.days ?? [fallbackDay],
+    documents: Array.isArray(trip.documents) ? trip.documents : fallback?.documents ?? [],
+    endsAt: isValidDateValue(trip.endsAt) && trip.endsAt ? trip.endsAt : fallback?.endsAt ?? new Date().toISOString(),
+    homeTimezone: trip.homeTimezone || fallback?.homeTimezone || 'Europe/Zurich',
+    startsAt: isValidDateValue(trip.startsAt) && trip.startsAt ? trip.startsAt : fallback?.startsAt ?? new Date().toISOString(),
+    stops: Array.isArray(trip.stops) ? trip.stops : fallback?.stops ?? [],
+    surprises: Array.isArray(trip.surprises) ? trip.surprises : fallback?.surprises ?? [],
+    title: trip.title || fallback?.title || 'New trip',
+    todos: Array.isArray(trip.todos) ? trip.todos : fallback?.todos ?? [],
+    travelers: Array.isArray(trip.travelers) && trip.travelers.length ? trip.travelers : fallback?.travelers ?? [],
+  };
+}
+
+function createFallbackTripInfo(tripId: string): TripInfo {
+  if (tripId === sampleTrip.id) {
+    return createTripInfo(sampleTrip);
+  }
+
+  const now = new Date().toISOString();
+
+  return {
+    endsAt: now,
+    homeTimezone: 'Europe/Zurich',
+    id: tripId,
+    startsAt: now,
+    title: 'New trip',
+    travelers: [],
+  };
+}
+
+function isValidDateValue(value?: string) {
+  return Boolean(value && !Number.isNaN(Date.parse(value)));
 }
 
 function createDefaultTripSummary(profile: UserProfile): TripSummary {
@@ -469,7 +511,18 @@ function isTripAccessible(summary: TripSummary, profile: UserProfile) {
 }
 
 function getTripDateRangeLabel(trip: Pick<Trip, 'startsAt' | 'endsAt'>) {
-  return `${formatShortDateTime(trip.startsAt)}-${formatShortDateTime(trip.endsAt)}`;
+  const startsAt = formatShortDateTime(trip.startsAt);
+  const endsAt = formatShortDateTime(trip.endsAt);
+
+  if (!startsAt && !endsAt) {
+    return 'Dates pending';
+  }
+
+  if (!startsAt || !endsAt) {
+    return startsAt || endsAt;
+  }
+
+  return `${startsAt}-${endsAt}`;
 }
 
 function normalizeStoredProfile(value: Partial<UserProfile> & { password?: string }): UserProfile {
@@ -480,7 +533,6 @@ function normalizeStoredProfile(value: Partial<UserProfile> & { password?: strin
     id: value.id ?? '',
     name: username,
     normalizedName: username,
-    photoUri: value.photoUri,
     username,
   };
 }
@@ -493,7 +545,6 @@ export default function App() {
   const [profileName, setProfileName] = useState('');
   const [profileEmail, setProfileEmail] = useState('');
   const [profilePassword, setProfilePassword] = useState('');
-  const [profilePhotoUri, setProfilePhotoUri] = useState('');
   const [authError, setAuthError] = useState('');
   const [tripSummaries, setTripSummaries] = useState<TripSummary[]>([]);
   const [tripListStatus, setTripListStatus] = useState(
@@ -614,12 +665,29 @@ export default function App() {
           setThemeKey(storedTheme as ThemeKey);
         }
 
-        if (storedProfile) {
-          const parsedProfile = normalizeStoredProfile(JSON.parse(storedProfile) as Partial<UserProfile>);
+        const parsedProfile = storedProfile
+          ? normalizeStoredProfile(JSON.parse(storedProfile) as Partial<UserProfile>)
+          : undefined;
+        const restoredProfile = isFirebaseSyncConfigured()
+          ? await getCurrentCloudUserProfile().catch(() => undefined)
+          : undefined;
+        const nextProfile = restoredProfile ?? parsedProfile;
+
+        if (!mounted) {
+          return;
+        }
+
+        if (nextProfile) {
+          await SecureStore.setItemAsync(PROFILE_KEY, JSON.stringify(nextProfile));
+          setProfile(nextProfile);
+          setProfileName(nextProfile.username || nextProfile.email);
+          setProfileEmail(nextProfile.email);
+          setLoggedIn(Boolean(restoredProfile));
+          setAuthMode('login');
+        } else if (parsedProfile) {
           setProfile(parsedProfile);
           setProfileName(parsedProfile.username || parsedProfile.email);
           setProfileEmail(parsedProfile.email);
-          setProfilePhotoUri(parsedProfile.photoUri ?? '');
           setAuthMode('login');
         } else {
           setAuthMode('create');
@@ -661,13 +729,14 @@ export default function App() {
         }
 
         if (storedTrip?.dataVersion === DATA_VERSION) {
-          setTripInfo(createTripInfoFromCloud(selectedTripId, storedTrip));
-          setStops(storedTrip.stops);
-          setDays(storedTrip.days);
-          setTodos(storedTrip.todos);
-          setDocuments(storedTrip.documents);
-          setSurprises(storedTrip.surprises);
-          setSelectedStopId(storedTrip.stops.find(isMapPlaceStop)?.id ?? storedTrip.stops[0]?.id ?? '');
+          const normalizedTrip = normalizeCloudTripData(selectedTripId, storedTrip);
+          setTripInfo(createTripInfoFromCloud(selectedTripId, normalizedTrip));
+          setStops(normalizedTrip.stops);
+          setDays(normalizedTrip.days);
+          setTodos(normalizedTrip.todos);
+          setDocuments(normalizedTrip.documents);
+          setSurprises(normalizedTrip.surprises);
+          setSelectedStopId(normalizedTrip.stops.find(isMapPlaceStop)?.id ?? normalizedTrip.stops[0]?.id ?? '');
           return;
         }
 
@@ -829,14 +898,15 @@ export default function App() {
               return;
             }
 
-            lastCloudSignature.current = getTripDataSignature(remoteTrip);
-            setTripInfo(createTripInfoFromCloud(selectedTripId, remoteTrip));
-            setStops(remoteTrip.stops);
-            setDays(remoteTrip.days);
-            setTodos(remoteTrip.todos);
-            setDocuments(remoteTrip.documents);
-            setSurprises(remoteTrip.surprises);
-            setSelectedStopId(remoteTrip.stops.find(isMapPlaceStop)?.id ?? remoteTrip.stops[0]?.id ?? '');
+            const normalizedTrip = normalizeCloudTripData(selectedTripId, remoteTrip);
+            lastCloudSignature.current = getTripDataSignature(normalizedTrip);
+            setTripInfo(createTripInfoFromCloud(selectedTripId, normalizedTrip));
+            setStops(normalizedTrip.stops);
+            setDays(normalizedTrip.days);
+            setTodos(normalizedTrip.todos);
+            setDocuments(normalizedTrip.documents);
+            setSurprises(normalizedTrip.surprises);
+            setSelectedStopId(normalizedTrip.stops.find(isMapPlaceStop)?.id ?? normalizedTrip.stops[0]?.id ?? '');
             setCloudReady(true);
           },
           onStatus: (status) => {
@@ -1041,7 +1111,6 @@ export default function App() {
       const nextProfile = await createCloudAccount({
         email,
         password,
-        photoUri: profilePhotoUri,
         username,
       });
       await SecureStore.setItemAsync(PROFILE_KEY, JSON.stringify(nextProfile));
@@ -1079,7 +1148,6 @@ export default function App() {
       setProfile(nextProfile);
       setProfileName(nextProfile.username);
       setProfileEmail(nextProfile.email);
-      setProfilePhotoUri(nextProfile.photoUri ?? '');
       setLoggedIn(true);
       setAuthError('');
       setProfilePassword('');
@@ -1093,7 +1161,13 @@ export default function App() {
     if (isFirebaseSyncConfigured()) {
       await signOutCloudAccount().catch(() => undefined);
     }
+    await Promise.all([
+      SecureStore.deleteItemAsync(PROFILE_KEY),
+      SecureStore.deleteItemAsync(TRIP_LIST_LAST_PROFILE_KEY),
+    ]).catch(() => undefined);
+    setProfile(undefined);
     setLoggedIn(false);
+    setProfileEmail('');
     setProfilePassword('');
   }
 
@@ -1823,12 +1897,10 @@ export default function App() {
           profileEmail={profileEmail}
           profileName={profileName}
           profilePassword={profilePassword}
-          profilePhotoUri={profilePhotoUri}
           setAuthMode={setAuthMode}
           setProfileEmail={setProfileEmail}
           setProfileName={setProfileName}
           setProfilePassword={setProfilePassword}
-          setProfilePhotoUri={setProfilePhotoUri}
           theme={theme}
         />
       </SafeAreaView>
@@ -2073,10 +2145,11 @@ export default function App() {
         inviteName={inviteName}
         inviteStatus={inviteStatus}
         onEnableNotifications={enableSurpriseNotifications}
+        onBackToTrips={closeTrip}
         onInviteMember={inviteMemberToTrip}
         onClose={closeSettings}
         onHiddenGestureStep={handleOwnerGestureStep}
-        onLogout={closeTrip}
+        onLogout={logoutProfile}
         pushStatus={pushStatus}
         profile={profile}
         selectedTripSummary={selectedTripSummary}
@@ -2110,12 +2183,10 @@ function ProfileGateScreen({
   profileEmail,
   profileName,
   profilePassword,
-  profilePhotoUri,
   setAuthMode,
   setProfileEmail,
   setProfileName,
   setProfilePassword,
-  setProfilePhotoUri,
   theme,
 }: {
   authError: string;
@@ -2126,12 +2197,10 @@ function ProfileGateScreen({
   profileEmail: string;
   profileName: string;
   profilePassword: string;
-  profilePhotoUri: string;
   setAuthMode: (mode: AuthMode) => void;
   setProfileEmail: (value: string) => void;
   setProfileName: (value: string) => void;
   setProfilePassword: (value: string) => void;
-  setProfilePhotoUri: (value: string) => void;
   theme: (typeof themes)[ThemeKey];
 }) {
   const isCreate = authMode === 'create';
@@ -2148,13 +2217,9 @@ function ProfileGateScreen({
       <ScrollView contentContainerStyle={styles.authScreen} keyboardShouldPersistTaps="handled">
         <View style={styles.profileHero}>
           <View style={[styles.profileAvatar, { backgroundColor: theme.accentDark }]}>
-            {profilePhotoUri.trim() ? (
-              <Image source={{ uri: profilePhotoUri.trim() }} style={styles.profileAvatarImage} />
-            ) : (
-              <Text style={styles.profileAvatarText}>
-                {getProfileInitials(profileName || existingProfile?.username || 'RT')}
-              </Text>
-            )}
+            <Text style={styles.profileAvatarText}>
+              {getProfileInitials(profileName || existingProfile?.username || 'RT')}
+            </Text>
           </View>
           <View style={styles.flexOne}>
             <Text style={[styles.eyebrow, { color: theme.muted }]}>Trip planner</Text>
@@ -2224,19 +2289,6 @@ function ProfileGateScreen({
             style={[styles.input, { borderColor: theme.border, color: theme.text, backgroundColor: theme.surface }]}
             value={profilePassword}
           />
-          {isCreate && (
-            <>
-              <Text style={[styles.controlLabel, { color: theme.muted }]}>Profile photo link</Text>
-              <TextInput
-                autoCapitalize="none"
-                onChangeText={setProfilePhotoUri}
-                placeholder="Optional image URL"
-                placeholderTextColor="#8A92A3"
-                style={[styles.input, { borderColor: theme.border, color: theme.text, backgroundColor: theme.surface }]}
-                value={profilePhotoUri}
-              />
-            </>
-          )}
           {authError ? <Text style={styles.errorText}>{authError}</Text> : null}
           <Pressable
             accessibilityRole="button"
@@ -4258,6 +4310,7 @@ function SettingsScreen({
   appVersion,
   inviteName,
   inviteStatus,
+  onBackToTrips,
   onEnableNotifications,
   onHiddenGestureStep,
   onInviteMember,
@@ -4274,6 +4327,7 @@ function SettingsScreen({
   appVersion: string;
   inviteName: string;
   inviteStatus: string;
+  onBackToTrips: () => void;
   onEnableNotifications: () => void;
   onHiddenGestureStep: (step: string) => void;
   onInviteMember: () => void;
@@ -4360,11 +4414,19 @@ function SettingsScreen({
         </Pressable>
         <Pressable
           accessibilityRole="button"
-          onPress={onLogout}
+          onPress={onBackToTrips}
           style={[styles.addButton, { backgroundColor: theme.softSurface }]}
         >
           <X size={18} color={theme.text} />
           <Text style={[styles.addButtonText, { color: theme.text }]}>Back to trips</Text>
+        </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          onPress={onLogout}
+          style={[styles.addButton, { backgroundColor: theme.text }]}
+        >
+          <KeyRound size={18} color={theme.surface} />
+          <Text style={[styles.addButtonText, { color: theme.surface }]}>Log out</Text>
         </Pressable>
       </View>
       <View style={[styles.primaryPanel, { backgroundColor: theme.surface, borderColor: theme.border }]}>
@@ -4387,6 +4449,7 @@ function SettingsModal({
   appVersion,
   inviteName,
   inviteStatus,
+  onBackToTrips,
   onEnableNotifications,
   onClose,
   onHiddenGestureStep,
@@ -4405,6 +4468,7 @@ function SettingsModal({
   appVersion: string;
   inviteName: string;
   inviteStatus: string;
+  onBackToTrips: () => void;
   onEnableNotifications: () => void;
   onClose: () => void;
   onHiddenGestureStep: (step: string) => void;
@@ -4438,6 +4502,7 @@ function SettingsModal({
             appVersion={appVersion}
             inviteName={inviteName}
             inviteStatus={inviteStatus}
+            onBackToTrips={onBackToTrips}
             onEnableNotifications={onEnableNotifications}
             onHiddenGestureStep={onHiddenGestureStep}
             onInviteMember={onInviteMember}
@@ -5093,6 +5158,10 @@ function formatDate(value: string) {
 }
 
 function formatShortDateTime(value: string) {
+  if (!isValidDateValue(value)) {
+    return '';
+  }
+
   return new Intl.DateTimeFormat('en', {
     month: 'short',
     day: 'numeric',

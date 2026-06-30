@@ -1,11 +1,13 @@
 import { getApps, initializeApp } from 'firebase/app';
 import type { FirebaseOptions } from 'firebase/app';
 import {
+  initializeAuth,
   createUserWithEmailAndPassword,
   deleteUser,
   getAuth,
   signInWithEmailAndPassword,
   signOut,
+  type Persistence,
   updateProfile,
 } from 'firebase/auth';
 import {
@@ -22,6 +24,7 @@ import {
   setDoc,
   where,
 } from 'firebase/firestore';
+import * as SecureStore from 'expo-secure-store';
 
 import {
   SurpriseStop,
@@ -38,7 +41,6 @@ declare const process: {
     EXPO_PUBLIC_FIREBASE_API_KEY?: string;
     EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN?: string;
     EXPO_PUBLIC_FIREBASE_PROJECT_ID?: string;
-    EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET?: string;
     EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID?: string;
     EXPO_PUBLIC_FIREBASE_APP_ID?: string;
     EXPO_PUBLIC_FIREBASE_TRIP_ID?: string;
@@ -85,7 +87,6 @@ export type CloudUserProfile = {
   id: string;
   name: string;
   normalizedName: string;
-  photoUri?: string;
   username: string;
 };
 
@@ -98,7 +99,40 @@ type StartCloudSyncOptions = {
   tripId: string;
 };
 
+type SecureStorePersistence = Persistence & {
+  _addListener: () => void;
+  _get: <T>(key: string) => Promise<T | null>;
+  _isAvailable: () => Promise<boolean>;
+  _remove: (key: string) => Promise<void>;
+  _removeListener: () => void;
+  _set: (key: string, value: unknown) => Promise<void>;
+};
+
 let initialized = false;
+let authInitialized = false;
+
+const secureStoreAuthPersistence: SecureStorePersistence = {
+  type: 'LOCAL',
+  async _isAvailable() {
+    return SecureStore.isAvailableAsync();
+  },
+  async _set(key, value) {
+    await SecureStore.setItemAsync(key, JSON.stringify(value));
+  },
+  async _get<T>(key: string) {
+    const value = await SecureStore.getItemAsync(key);
+    return value ? (JSON.parse(value) as T) : null;
+  },
+  async _remove(key) {
+    await SecureStore.deleteItemAsync(key);
+  },
+  _addListener() {
+    // SecureStore has no cross-tab event model in React Native.
+  },
+  _removeListener() {
+    // SecureStore has no cross-tab event model in React Native.
+  },
+};
 
 export function isFirebaseSyncConfigured() {
   return Boolean(
@@ -290,20 +324,17 @@ export async function listenTripsForMember({
 export async function createCloudAccount({
   email,
   password,
-  photoUri,
   username,
 }: {
   email: string;
   password: string;
-  photoUri?: string;
   username: string;
 }) {
   const app = getFirebaseApp();
-  const auth = getAuth(app);
+  const auth = getFirebaseAuth();
   const db = getFirestore(app);
   const normalizedUsername = normalizeUsername(username);
   const normalizedEmail = normalizeEmail(email);
-  const normalizedPhotoUri = photoUri?.trim();
 
   const credentials = await createUserWithEmailAndPassword(auth, normalizedEmail, password);
   await credentials.user.getIdToken(true);
@@ -313,7 +344,6 @@ export async function createCloudAccount({
     name: normalizedUsername,
     normalizedName: normalizedUsername,
     username: normalizedUsername,
-    ...(normalizedPhotoUri ? { photoUri: normalizedPhotoUri } : {}),
   };
 
   try {
@@ -340,7 +370,6 @@ export async function createCloudAccount({
 
     await updateProfile(credentials.user, {
       displayName: normalizedUsername,
-      photoURL: profile.photoUri ?? null,
     }).catch(() => undefined);
 
     return profile;
@@ -352,7 +381,7 @@ export async function createCloudAccount({
 
 export async function signInCloudAccount(identifier: string, password: string) {
   const app = getFirebaseApp();
-  const auth = getAuth(app);
+  const auth = getFirebaseAuth();
   const email = identifier.includes('@')
     ? normalizeEmail(identifier)
     : (await getUsernameIndex(identifier))?.email;
@@ -373,8 +402,18 @@ export async function signInCloudAccount(identifier: string, password: string) {
 }
 
 export async function signOutCloudAccount() {
-  const app = getFirebaseApp();
-  await signOut(getAuth(app));
+  await signOut(getFirebaseAuth());
+}
+
+export async function getCurrentCloudUserProfile() {
+  const auth = getFirebaseAuth();
+  await auth.authStateReady();
+
+  if (!auth.currentUser) {
+    return undefined;
+  }
+
+  return getUserProfileById(auth.currentUser.uid);
 }
 
 export async function findUserProfile(identifier: string): Promise<CloudUserProfile | undefined> {
@@ -474,18 +513,34 @@ function normalizeCloudUserProfile(data: unknown, uid: string): CloudUserProfile
     id: uid,
     name: username,
     normalizedName: username,
-    photoUri: profile.photoUri,
     username,
   };
 }
 
 function requireSignedInUser() {
-  const app = getFirebaseApp();
-  const user = getAuth(app).currentUser;
+  const user = getFirebaseAuth().currentUser;
 
   if (!user) {
     throw new Error('Firebase account login is required');
   }
+}
+
+function getFirebaseAuth() {
+  const app = getFirebaseApp();
+
+  if (!authInitialized) {
+    try {
+      const auth = initializeAuth(app, {
+        persistence: secureStoreAuthPersistence,
+      });
+      authInitialized = true;
+      return auth;
+    } catch {
+      authInitialized = true;
+    }
+  }
+
+  return getAuth(app);
 }
 
 function stripUndefined<T>(value: T): T {
@@ -524,6 +579,5 @@ function getFirebaseConfig(): FirebaseOptions {
     authDomain: process.env.EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN,
     messagingSenderId: process.env.EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
     projectId: process.env.EXPO_PUBLIC_FIREBASE_PROJECT_ID,
-    storageBucket: process.env.EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET,
   };
 }

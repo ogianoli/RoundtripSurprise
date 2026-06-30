@@ -19,7 +19,6 @@ Add these values to the EAS `production` environment:
 npx eas-cli@latest env:create --environment production --visibility plaintext --name EXPO_PUBLIC_FIREBASE_API_KEY --value "..."
 npx eas-cli@latest env:create --environment production --visibility plaintext --name EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN --value "..."
 npx eas-cli@latest env:create --environment production --visibility plaintext --name EXPO_PUBLIC_FIREBASE_PROJECT_ID --value "..."
-npx eas-cli@latest env:create --environment production --visibility plaintext --name EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET --value "..."
 npx eas-cli@latest env:create --environment production --visibility plaintext --name EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID --value "..."
 npx eas-cli@latest env:create --environment production --visibility plaintext --name EXPO_PUBLIC_FIREBASE_APP_ID --value "..."
 ```
@@ -71,7 +70,8 @@ Before a public App Store release, tighten this with real authenticated users an
 - Remote edits from another phone are pulled into the app and then cached locally.
 - Push notification device tokens are stored in the same trip document under `pushDevices`.
 - Each phone must open Settings and enable surprise alerts once before it can receive reveal notifications.
-- PDF files still live locally in this version; cloud file storage for PDFs/photos should be a later pass.
+- Profile photos are disabled in this version to avoid Firebase Storage billing setup.
+- PDF files still live locally in this version; cloud file storage for PDFs should be a later pass.
 
 ## Registration Troubleshooting
 
